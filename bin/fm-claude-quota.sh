@@ -58,24 +58,31 @@
 # polling path, not with the reader itself.
 #
 # Output: one "key=value" line per meter on stdout, only on success (exit 0).
-# A key whose header this account/plan did not return, or whose value fails
-# its shape check below, prints "unknown" - never a fabricated zero and never
-# a hard failure, because a different account, plan, or Anthropic rollout can
-# return a different subset of the documented anthropic-ratelimit-unified-*
-# headers, and a header value that arrives malformed must never be read as a
-# real (and possibly falsely reassuring) reading. An unrecognised header
-# present in the response is simply ignored. Every *_utilization value is
+# Split each line on the FIRST "=" only - no value here contains one today,
+# but none is guaranteed not to in the future. A key whose header this
+# account/plan did not return, or whose value fails its shape check below,
+# prints "unknown" - never a fabricated zero and never a hard failure,
+# because a different account, plan, or Anthropic rollout can return a
+# different subset of the documented anthropic-ratelimit-unified-* headers,
+# and a header value that arrives malformed must never be read as a real
+# (and possibly falsely reassuring) reading. Every *_utilization value is
 # checked against ^[0-9]+([.][0-9]+)?$ (a non-negative decimal - utilization
 # can legitimately exceed 1 once a cap is overrun) and every *_reset value
-# against ^[1-9][0-9]*$ (a positive integer Unix epoch second); either one
-# failing its check reads "unknown" rather than passing through whatever
-# arrived.
+# against ^[1-9][0-9]*$ (a positive integer Unix epoch second) - this is a
+# SHAPE check only, not a plausibility one: a syntactically valid but absurd
+# epoch (e.g. "1") still passes as a reading, because bounding "plausible"
+# would need this script to trust its own clock, and Anthropic controls this
+# value regardless. Either shape check failing reads "unknown" rather than
+# passing through whatever arrived.
 #
 #   probe_http_status                    the HTTP status this reading came
 #                                         from. Usually 2xx; see below for why
 #                                         a non-2xx can still carry a reading.
 #   unified_status                       overall verdict: allowed |
 #                                         allowed_warning | rejected | unknown
+#   unified_reset                        the reset time unified_status itself
+#                                         is keyed to (distinct from the
+#                                         per-window resets below)
 #   five_hour_status five_hour_reset five_hour_utilization
 #                                         the rolling 5-hour session window
 #   seven_day_status seven_day_reset seven_day_utilization
@@ -95,29 +102,55 @@
 #                                         unified_status is currently keyed to
 #   upgrade_paths                        comma-list of paths Anthropic
 #                                         currently offers this account
+#   fallback_percentage                  a further utilization-shaped meter
+#                                         Anthropic has been observed to add
+#   unmapped_unified_headers             count of anthropic-ratelimit-unified-*
+#                                         response headers that matched none
+#                                         of the field names above. The header
+#                                         set has been observed to change
+#                                         within days (a header this script
+#                                         once confirmed absent can reappear),
+#                                         so a nonzero count here is a signal
+#                                         that a future header set may carry
+#                                         quota information this script does
+#                                         not yet surface by name - it is not
+#                                         itself a failure.
 #
 # utilization is a 0-1 fraction (0.94 = 94% used, and can exceed 1 once a
 # spend cap is overrun); reset is a Unix epoch second. Neither is reformatted
 # here - a caller wanting a clock time or a percentage string converts it.
 #
 # Failure is always closed and always explicit, on stderr, with a nonzero
-# exit: no token, curl missing, the HTTP call failing or timing out, or a
-# response - of any HTTP status - that carries none of the
-# anthropic-ratelimit-unified-* headers at all. None of these print any
-# "key=value" line - a caller must never mistake a failed probe for a real
-# all-unknown reading.
+# exit: no token, curl missing, the HTTP call failing or timing out, a
+# response - of any HTTP status - that carries no anthropic-ratelimit-unified-*
+# headers at all, or a response that carries such headers but whose values
+# ALL fail their shape check (which reads identically to "this plan reports
+# fewer meters" unless it is itself distinguished - see the header-count and
+# parsed-count guards below). None of these print any "key=value" line - a
+# caller must never mistake a failed probe for a real all-unknown reading.
 #
 # A response that carries these headers is parsed and emitted exactly the
 # same way regardless of its HTTP status: a rate-limited or rejected call
 # (429, 403) is precisely the state where the reading matters most, and
 # Anthropic's own server volunteers it right alongside the rejection. Only a
-# response carrying no meters at all - a malformed call, a wrong endpoint, a
-# contract change - is treated as a probe failure rather than a reading.
+# response carrying no usable meters at all - a malformed call, a wrong
+# endpoint, a contract change - is treated as a probe failure rather than a
+# reading. Whether a 5xx (as opposed to 4xx) carrying meters should be
+# trusted the same way is an open design question for whichever later work
+# wires this reader into a routing path, not settled here; a careful caller
+# should gate on probe_http_status until it is.
 set -u
 export LC_ALL=C
 set +o xtrace
 
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-claude-quota.sh"
+# The file this script itself was invoked as - read directly, with no
+# reconstruction, so --help still works when this script is reached through a
+# symlink or a renamed copy (bin/fm-afk-return.sh uses this same convention).
+# A previous version of this file computed a path by appending a hard-coded
+# literal filename to dirname("${BASH_SOURCE[0]}"), which broke --help under
+# exactly that symlink/rename case - fixed here by using BASH_SOURCE[0]
+# itself, which always resolves to whatever was actually invoked.
+SELF="${BASH_SOURCE[0]}"
 
 fm_claude_quota_usage() {
   awk '
@@ -150,8 +183,14 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --help|-h)
-      fm_claude_quota_usage
-      exit 0
+      # Exit status reflects whether the usage text was actually readable -
+      # not an unconditional success - so a broken SELF path (or any other
+      # reason awk fails) is reported rather than silently exiting 0.
+      if fm_claude_quota_usage; then
+        exit 0
+      fi
+      printf 'fm-claude-quota.sh: could not read this script'"'"'s own usage text from %s.\n' "$SELF" >&2
+      exit 1
       ;;
     *)
       printf 'fm-claude-quota.sh: unrecognised argument: %s\n' "$1" >&2
@@ -276,16 +315,18 @@ esac
 
 # fm_claude_quota_field <header-name>: the last matching header's value from
 # HEADERS_FILE (deliberately the last on a duplicate - matches curl/HTTP
-# semantics for a repeated header), trimmed and with a trailing CR stripped,
-# or empty when the header is absent. Grep -i so a lowercased HTTP/2 response
-# still matches.
+# semantics for a repeated header), with leading whitespace and trailing
+# whitespace (RFC 9110 OWS - including a trailing CR from a CRLF response,
+# since \r is itself whitespace under the C locale this script exports)
+# stripped symmetrically. Grep -i so a lowercased HTTP/2 response, which
+# lowercases every header name on the wire, still matches.
 fm_claude_quota_field() {
   local name=$1 line
   line=$(grep -i "^${name}:" "$HEADERS_FILE" 2>/dev/null | tail -n1) || return 0
   [ -n "$line" ] || return 0
   line=${line#*:}
   line=${line#"${line%%[![:space:]]*}"}
-  line=${line%$'\r'}
+  line=${line%"${line##*[![:space:]]}"}
   printf '%s' "$line"
 }
 
@@ -321,21 +362,62 @@ fm_claude_quota_or_unknown() {
   printf '%s\n' "$value"
 }
 
+UNIFIED_STATUS=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-status raw)
+UNIFIED_RESET=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-reset reset)
+FIVE_HOUR_STATUS=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-5h-status raw)
+FIVE_HOUR_RESET=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-5h-reset reset)
+FIVE_HOUR_UTILIZATION=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-5h-utilization utilization)
+SEVEN_DAY_STATUS=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-status raw)
+SEVEN_DAY_RESET=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-reset reset)
+SEVEN_DAY_UTILIZATION=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-utilization utilization)
+SEVEN_DAY_SURPASSED_THRESHOLD=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-surpassed-threshold utilization)
+OVERAGE_STATUS=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-status raw)
+OVERAGE_RESET=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-reset reset)
+OVERAGE_UTILIZATION=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-utilization utilization)
+OVERAGE_SURPASSED_THRESHOLD=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-surpassed-threshold utilization)
+OVERAGE_DISABLED_REASON=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-disabled-reason raw)
+REPRESENTATIVE_CLAIM=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-representative-claim raw)
+UPGRADE_PATHS=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-upgrade-paths raw)
+FALLBACK_PERCENTAGE=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-fallback-percentage utilization)
+
+# Headers are present (HEADER_HITS > 0), but "present" is not "usable": every
+# value above can independently degrade to "unknown" (BB2). If every single
+# numeric meter did, this reading carries no usable number at all and must
+# not exit 0 looking identical to a plan that legitimately has fewer windows.
+PARSED_NUMERIC_COUNT=0
+for value in "$UNIFIED_RESET" "$FIVE_HOUR_RESET" "$FIVE_HOUR_UTILIZATION" \
+  "$SEVEN_DAY_RESET" "$SEVEN_DAY_UTILIZATION" "$SEVEN_DAY_SURPASSED_THRESHOLD" \
+  "$OVERAGE_RESET" "$OVERAGE_UTILIZATION" "$OVERAGE_SURPASSED_THRESHOLD" \
+  "$FALLBACK_PERCENTAGE"; do
+  [ "$value" = unknown ] || PARSED_NUMERIC_COUNT=$((PARSED_NUMERIC_COUNT + 1))
+done
+if [ "$PARSED_NUMERIC_COUNT" -eq 0 ]; then
+  printf 'fm-claude-quota.sh: the probe returned HTTP %s with anthropic-ratelimit-unified-* headers present, but no numeric meter parsed as valid; treating this as a probe failure rather than an all-unknown reading.\n' "$HTTP_CODE" >&2
+  exit 1
+fi
+
+KNOWN_UNIFIED_HEADER_REGEX='^anthropic-ratelimit-unified-(status|reset|5h-status|5h-reset|5h-utilization|7d-status|7d-reset|7d-utilization|7d-surpassed-threshold|overage-status|overage-reset|overage-utilization|overage-surpassed-threshold|overage-disabled-reason|representative-claim|upgrade-paths|fallback-percentage):'
+UNMAPPED_HITS=$(grep -i '^anthropic-ratelimit-unified-' "$HEADERS_FILE" 2>/dev/null | grep -Evic "$KNOWN_UNIFIED_HEADER_REGEX") || UNMAPPED_HITS=0
+case "$UNMAPPED_HITS" in ''|*[!0-9]*) UNMAPPED_HITS=0 ;; esac
+
 printf 'probe_http_status=%s\n' "$HTTP_CODE"
-printf 'unified_status=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-status raw)"
-printf 'five_hour_status=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-5h-status raw)"
-printf 'five_hour_reset=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-5h-reset reset)"
-printf 'five_hour_utilization=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-5h-utilization utilization)"
-printf 'seven_day_status=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-status raw)"
-printf 'seven_day_reset=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-reset reset)"
-printf 'seven_day_utilization=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-utilization utilization)"
-printf 'seven_day_surpassed_threshold=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-7d-surpassed-threshold utilization)"
-printf 'overage_status=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-status raw)"
-printf 'overage_reset=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-reset reset)"
-printf 'overage_utilization=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-utilization utilization)"
-printf 'overage_surpassed_threshold=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-surpassed-threshold utilization)"
-printf 'overage_disabled_reason=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-overage-disabled-reason raw)"
-printf 'representative_claim=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-representative-claim raw)"
-printf 'upgrade_paths=%s\n' "$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-upgrade-paths raw)"
+printf 'unified_status=%s\n' "$UNIFIED_STATUS"
+printf 'unified_reset=%s\n' "$UNIFIED_RESET"
+printf 'five_hour_status=%s\n' "$FIVE_HOUR_STATUS"
+printf 'five_hour_reset=%s\n' "$FIVE_HOUR_RESET"
+printf 'five_hour_utilization=%s\n' "$FIVE_HOUR_UTILIZATION"
+printf 'seven_day_status=%s\n' "$SEVEN_DAY_STATUS"
+printf 'seven_day_reset=%s\n' "$SEVEN_DAY_RESET"
+printf 'seven_day_utilization=%s\n' "$SEVEN_DAY_UTILIZATION"
+printf 'seven_day_surpassed_threshold=%s\n' "$SEVEN_DAY_SURPASSED_THRESHOLD"
+printf 'overage_status=%s\n' "$OVERAGE_STATUS"
+printf 'overage_reset=%s\n' "$OVERAGE_RESET"
+printf 'overage_utilization=%s\n' "$OVERAGE_UTILIZATION"
+printf 'overage_surpassed_threshold=%s\n' "$OVERAGE_SURPASSED_THRESHOLD"
+printf 'overage_disabled_reason=%s\n' "$OVERAGE_DISABLED_REASON"
+printf 'representative_claim=%s\n' "$REPRESENTATIVE_CLAIM"
+printf 'upgrade_paths=%s\n' "$UPGRADE_PATHS"
+printf 'fallback_percentage=%s\n' "$FALLBACK_PERCENTAGE"
+printf 'unmapped_unified_headers=%s\n' "$UNMAPPED_HITS"
 
 exit 0
