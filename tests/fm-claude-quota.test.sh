@@ -26,6 +26,24 @@ SCRIPT="$ROOT/bin/fm-claude-quota.sh"
 TMP_ROOT=$(fm_test_tmproot fm-claude-quota)
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 
+# assert_kv_line <haystack> <line> <msg>: <line> must appear as a whole line
+# in <haystack> - not merely as a substring, which is the unanchored-match
+# shape a 2026-08-30 review round showed lets a script sending
+# "max_tokens":16384 pass an assertion for "max_tokens":1 (BLOCK-1), and
+# would equally let "unmapped_unified_headers=1" pass for a real value of 10.
+# $out has a real newline between every emitted field, so a plain per-line
+# exact match is both correct and simple - no regex anchoring needed.
+assert_kv_line() {
+  printf '%s\n' "$1" | grep -qxF -- "$2" || fail "$3"$'\n'"--- output ---"$'\n'"$1"
+}
+
+# assert_not_kv_line: the negation of assert_kv_line.
+assert_not_kv_line() {
+  if printf '%s\n' "$1" | grep -qxF -- "$2"; then
+    fail "$3"$'\n'"--- output ---"$'\n'"$1"
+  fi
+}
+
 # crlf <lines...>: joins its arguments with real \r\n, terminated by \r\n,
 # matching the live API's actual wire format (HTTP/2, CRLF - curl still
 # writes CRLF into the -D file it hands us for an HTTP/2 response).
@@ -214,6 +232,37 @@ crlf \
   'anthropic-ratelimit-unified-overage-reset: garbage' \
   > "$ALL_MALFORMED_FIXTURE"
 
+# Every real MEASUREMENT (*_utilization, *_reset) malformed, but a static
+# threshold and the auxiliary fallback meter both parse validly - a 2026-08-30
+# review showed an earlier version of the parsed-meter guard counted these
+# two alongside real measurements, so this exact shape survived as a false
+# exit-0 all-unknown-for-the-numbers-that-matter reading (ADV-4).
+THRESHOLD_ONLY_FIXTURE="$TMP_ROOT/threshold-only.txt"
+crlf \
+  'HTTP/2 429 ' \
+  'anthropic-ratelimit-unified-status: rejected' \
+  'anthropic-ratelimit-unified-5h-utilization: nope' \
+  'anthropic-ratelimit-unified-5h-reset: nope' \
+  'anthropic-ratelimit-unified-7d-utilization: nope' \
+  'anthropic-ratelimit-unified-7d-reset: nope' \
+  'anthropic-ratelimit-unified-overage-utilization: nope' \
+  'anthropic-ratelimit-unified-overage-reset: nope' \
+  'anthropic-ratelimit-unified-overage-surpassed-threshold: 1.0' \
+  'anthropic-ratelimit-unified-fallback-percentage: 0.5' \
+  > "$THRESHOLD_ONLY_FIXTURE"
+
+# Only raw fields (status, disabled_reason) present and valid - no
+# *_utilization or *_reset header at all. This script deliberately fails
+# closed here (ADV-5): a status with no number attached is not something a
+# quota-aware caller can act on. Documented as a deliberate, unobserved-case
+# choice, not a proven-necessary one - see the header comment.
+RAW_ONLY_FIXTURE="$TMP_ROOT/raw-only.txt"
+crlf \
+  'HTTP/2 429 ' \
+  'anthropic-ratelimit-unified-status: rejected' \
+  'anthropic-ratelimit-unified-overage-disabled-reason: org_spend_cap_reached' \
+  > "$RAW_ONLY_FIXTURE"
+
 # The exact case AA3 proved: RFC 9110 permits trailing optional whitespace,
 # and the live server's own status line carries one ("HTTP/2 200 ") - a
 # trailing space before the CRLF must not turn a valid value into "unknown".
@@ -311,15 +360,18 @@ test_full_headers_parse_and_distinguish_seat_from_spend_cap() {
   home="$TMP_ROOT/full"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT")
-  assert_contains "$out" "probe_http_status=200" "the HTTP status this reading came from"
-  assert_contains "$out" "unified_status=allowed_warning" "top-level status, sent here under a mixed-case header name"
-  assert_contains "$out" "five_hour_utilization=0.13" "5h window"
-  assert_contains "$out" "seven_day_utilization=0.94" "seat/weekly window (7d)"
-  assert_contains "$out" "seven_day_surpassed_threshold=0.75" "seat threshold"
-  assert_contains "$out" "overage_utilization=1.05" "spend cap (overage), distinct from seven_day_utilization"
-  assert_contains "$out" "overage_disabled_reason=org_spend_cap_reached" "spend cap reason"
-  assert_not_contains "$out" "overage_utilization=0.94" "overage must never be conflated with the seat window's value"
-  pass "full header set parses (mixed-case header name, real CRLF/HTTP2 wire format), keeping the seat window and spend cap distinct"
+  assert_kv_line "$out" "probe_http_status=200" "the HTTP status this reading came from"
+  assert_kv_line "$out" "unified_status=allowed_warning" "top-level status, sent here under a mixed-case header name"
+  assert_kv_line "$out" "five_hour_utilization=0.13" "5h window"
+  assert_kv_line "$out" "seven_day_utilization=0.94" "seat/weekly window (7d)"
+  assert_kv_line "$out" "seven_day_surpassed_threshold=0.75" "seat threshold"
+  assert_kv_line "$out" "overage_utilization=1.05" "spend cap (overage), distinct from seven_day_utilization"
+  assert_kv_line "$out" "overage_surpassed_threshold=1.0" "spend cap threshold - the other half of the seat/spend-cap pair (ADV-2): the utilization conflation alone was pinned, but not this one, so a mapping mistake between the two thresholds went unnoticed"
+  assert_kv_line "$out" "overage_disabled_reason=org_spend_cap_reached" "spend cap reason"
+  assert_kv_line "$out" "representative_claim=seven_day" "which window unified_status is keyed to (ADV-2: previously unpinned, so a mis-mapping to another field would not have been noticed)"
+  assert_not_kv_line "$out" "overage_utilization=0.94" "overage must never be conflated with the seat window's value"
+  assert_not_kv_line "$out" "overage_surpassed_threshold=0.75" "the spend-cap threshold must never be conflated with the seat threshold's value (ADV-2)"
+  pass "full header set parses (mixed-case header name, real CRLF/HTTP2 wire format), keeping the seat window and spend cap distinct on both utilization and threshold"
 }
 
 test_unrecognised_header_does_not_break_parsing_of_the_full_set() {
@@ -327,14 +379,15 @@ test_unrecognised_header_does_not_break_parsing_of_the_full_set() {
   home="$TMP_ROOT/unrecognised"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$UNRECOGNISED_FIXTURE" "$SCRIPT")
-  assert_contains "$out" "five_hour_utilization=0.13" "an unrecognised header must not block a real one that arrives alongside it"
-  assert_contains "$out" "seven_day_utilization=0.94" "seat window still parses"
-  assert_contains "$out" "overage_utilization=1.05" "spend cap still parses"
-  assert_contains "$out" "upgrade_paths=overage" "a documented field still parses"
-  assert_contains "$out" "unified_reset=1788098400" "a header this script did not originally name (AA4) is now parsed explicitly"
-  assert_contains "$out" "fallback_percentage=0.5" "the newer fallback meter (AA4) is now parsed explicitly"
-  assert_contains "$out" "unmapped_unified_headers=1" "the one genuinely unrecognised header is counted, not silently dropped with no signal"
-  pass "an unrecognised header is ignored rather than breaking parsing, and is counted rather than vanishing with no signal"
+  assert_kv_line "$out" "five_hour_utilization=0.13" "an unrecognised header must not block a real one that arrives alongside it"
+  assert_kv_line "$out" "seven_day_utilization=0.94" "seat window still parses"
+  assert_kv_line "$out" "overage_utilization=1.05" "spend cap still parses"
+  assert_kv_line "$out" "upgrade_paths=overage" "a documented field still parses"
+  assert_kv_line "$out" "unified_reset=1788098400" "a header this script did not originally name (AA4) is now parsed explicitly"
+  assert_kv_line "$out" "fallback_percentage=0.5" "the newer fallback meter (AA4) is now parsed explicitly"
+  assert_kv_line "$out" "unmapped_unified_headers=1" "the one genuinely unrecognised header is counted, not silently dropped with no signal (line-exact - an unanchored match here would also pass for a real count of 10)"
+  assert_kv_line "$out" "unmapped_unified_header_names=completely-invented-field" "the unmapped header's own NAME is surfaced too (ADV-6) - a count alone was shown to go stale within hours of being written"
+  pass "an unrecognised header is ignored rather than breaking parsing, and both its count and its name are surfaced rather than vanishing with no signal"
 }
 
 test_subset_headers_report_missing_meters_as_unknown_not_zero() {
@@ -342,11 +395,11 @@ test_subset_headers_report_missing_meters_as_unknown_not_zero() {
   home="$TMP_ROOT/subset"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$SUBSET_FIXTURE" "$SCRIPT")
-  assert_contains "$out" "five_hour_utilization=0.02" "the meter this fixture does carry still parses"
-  assert_contains "$out" "seven_day_status=unknown" "an absent meter reads unknown"
-  assert_not_contains "$out" "seven_day_status=0" "an absent meter must never read as a fabricated zero"
-  assert_contains "$out" "overage_status=unknown" "the other absent meter also reads unknown"
-  assert_contains "$out" "overage_disabled_reason=unknown" "an absent reason field reads unknown too"
+  assert_kv_line "$out" "five_hour_utilization=0.02" "the meter this fixture does carry still parses"
+  assert_kv_line "$out" "seven_day_status=unknown" "an absent meter reads unknown"
+  assert_not_kv_line "$out" "seven_day_status=0" "an absent meter must never read as a fabricated zero"
+  assert_kv_line "$out" "overage_status=unknown" "the other absent meter also reads unknown"
+  assert_kv_line "$out" "overage_disabled_reason=unknown" "an absent reason field reads unknown too"
   pass "a plan-limited header subset reports missing meters as unknown, not zero, not a failure"
 }
 
@@ -382,9 +435,9 @@ test_non_2xx_with_full_headers_is_parsed_not_discarded() {
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HTTP_CODE=429 FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT")
   rc=$?
   expect_code 0 "$rc" "a rate-limited response that still carries a complete reading must not be discarded"
-  assert_contains "$out" "probe_http_status=429" "the caller can see this reading arrived alongside a non-2xx"
-  assert_contains "$out" "seven_day_utilization=0.94" "the seat reading survives"
-  assert_contains "$out" "overage_status=rejected" "the spend cap reading survives - this is the state that matters most"
+  assert_kv_line "$out" "probe_http_status=429" "the caller can see this reading arrived alongside a non-2xx"
+  assert_kv_line "$out" "seven_day_utilization=0.94" "the seat reading survives"
+  assert_kv_line "$out" "overage_status=rejected" "the spend cap reading survives - this is the state that matters most"
   pass "a 429/403 response carrying the unified headers is parsed and emitted, with probe_http_status recording the real status"
 }
 
@@ -399,6 +452,28 @@ test_headers_present_but_every_value_malformed_fails_closed() {
   pass "a response carrying unified headers where every single numeric meter is malformed fails closed instead of a clean exit-0 all-unknown reading"
 }
 
+test_valid_threshold_and_fallback_do_not_rescue_all_malformed_measurements() {
+  local home fakebin out rc
+  home="$TMP_ROOT/threshold-only"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HTTP_CODE=429 FAKE_HEADERS_FIXTURE="$THRESHOLD_ONLY_FIXTURE" "$SCRIPT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "a valid threshold or fallback_percentage must not count toward the parsed-meter guard when every real measurement is malformed (ADV-4)"
+  assert_not_contains "$out" "=" "a probe failure must never print any key=value line"
+  pass "a response where only a static threshold and the auxiliary fallback meter parse, with every real *_utilization/*_reset measurement malformed, still fails closed"
+}
+
+test_raw_fields_only_with_no_measurement_fails_closed() {
+  local home fakebin out rc
+  home="$TMP_ROOT/raw-only"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HTTP_CODE=429 FAKE_HEADERS_FIXTURE="$RAW_ONLY_FIXTURE" "$SCRIPT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "a response with only raw fields (status, disabled_reason) and no *_utilization/*_reset header at all is a deliberate fail-closed case (ADV-5), documented as an unobserved-but-chosen behaviour"
+  assert_not_contains "$out" "=" "a probe failure must never print any key=value line"
+  pass "a response carrying only raw fields and no numeric measurement at all fails closed, per this script's documented (and deliberately conservative) choice"
+}
+
 test_malformed_header_values_read_unknown_not_a_fabricated_reading() {
   local home fakebin out rc
   home="$TMP_ROOT/bad-values"; mkdir -p "$home"
@@ -406,13 +481,13 @@ test_malformed_header_values_read_unknown_not_a_fabricated_reading() {
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$BAD_VALUES_FIXTURE" "$SCRIPT")
   rc=$?
   expect_code 0 "$rc" "malformed values degrade individual fields, they do not fail the whole probe when at least one meter is usable"
-  assert_contains "$out" "five_hour_utilization=unknown" "a non-numeric utilization must read unknown, not pass through"
-  assert_not_contains "$out" "five_hour_utilization=not-a-number" "the raw garbage value must never be emitted"
-  assert_contains "$out" "five_hour_reset=unknown" "a non-integer reset must read unknown"
-  assert_not_contains "$out" "five_hour_reset=yesterday" "the raw garbage value must never be emitted"
-  assert_contains "$out" "seven_day_utilization=unknown" "a negative utilization must read unknown, never a fabricated reading"
-  assert_not_contains "$out" "seven_day_utilization=-0.5" "the raw negative value must never be emitted"
-  assert_contains "$out" "seven_day_reset=1788098400" "a validly-shaped value in the same response still parses normally"
+  assert_kv_line "$out" "five_hour_utilization=unknown" "a non-numeric utilization must read unknown, not pass through"
+  assert_not_kv_line "$out" "five_hour_utilization=not-a-number" "the raw garbage value must never be emitted"
+  assert_kv_line "$out" "five_hour_reset=unknown" "a non-integer reset must read unknown"
+  assert_not_kv_line "$out" "five_hour_reset=yesterday" "the raw garbage value must never be emitted"
+  assert_kv_line "$out" "seven_day_utilization=unknown" "a negative utilization must read unknown, never a fabricated reading"
+  assert_not_kv_line "$out" "seven_day_utilization=-0.5" "the raw negative value must never be emitted"
+  assert_kv_line "$out" "seven_day_reset=1788098400" "a validly-shaped value in the same response still parses normally"
   pass "malformed *_utilization and *_reset values read unknown instead of passing through as a fabricated reading"
 }
 
@@ -421,8 +496,8 @@ test_trailing_whitespace_on_a_header_value_still_parses() {
   home="$TMP_ROOT/trailing-ows"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$TRAILING_OWS_FIXTURE" "$SCRIPT")
-  assert_contains "$out" "seven_day_utilization=0.96" "RFC 9110 permits trailing OWS on a header value; it must not turn a valid reading into unknown"
-  assert_not_contains "$out" "seven_day_utilization=unknown" "trailing whitespace must not be read as malformed"
+  assert_kv_line "$out" "seven_day_utilization=0.96" "RFC 9110 permits trailing OWS on a header value; it must not turn a valid reading into unknown"
+  assert_not_kv_line "$out" "seven_day_utilization=unknown" "trailing whitespace must not be read as malformed"
   pass "trailing whitespace on a header value is stripped, not read as malformed"
 }
 
@@ -431,8 +506,8 @@ test_duplicate_header_last_value_wins() {
   home="$TMP_ROOT/duplicate-header"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$DUPLICATE_HEADER_FIXTURE" "$SCRIPT")
-  assert_contains "$out" "seven_day_utilization=0.99" "a duplicated header must resolve to its last value, not its first"
-  assert_not_contains "$out" "seven_day_utilization=0.10" "the earlier, superseded value must not win"
+  assert_kv_line "$out" "seven_day_utilization=0.99" "a duplicated header must resolve to its last value, not its first"
+  assert_not_kv_line "$out" "seven_day_utilization=0.10" "the earlier, superseded value must not win"
   pass "a duplicated header resolves to its last value"
 }
 
@@ -479,6 +554,49 @@ test_token_never_leaks_under_xtrace() {
   pass "the token never leaks through a bash -x trace of this script"
 }
 
+# make_slow_fake_curl <dir>: like make_fake_curl, but writes the response
+# headers immediately and then sleeps a few seconds before exiting - long
+# enough for a case to signal the wrapping script mid-call.
+make_slow_fake_curl() {
+  local dir=$1 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+dfile=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -D) dfile=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$dfile" ] && printf 'HTTP/2 200 \r\nanthropic-ratelimit-unified-status: allowed\r\n' > "$dfile"
+sleep 5
+exit 0
+SH
+  chmod +x "$fakebin/curl"
+  printf '%s\n' "$fakebin"
+}
+
+test_sigterm_mid_call_cleans_up_exits_143_and_does_not_leak_under_xtrace() {
+  local home fakebin tmpdir out_file pid rc token_hits
+  home="$TMP_ROOT/sigterm"; mkdir -p "$home"
+  fakebin=$(make_slow_fake_curl "$home")
+  tmpdir="$home/tmp"; mkdir -p "$tmpdir"
+  out_file="$home/out.txt"
+  TMPDIR="$tmpdir" PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN='sigterm-canary-token-value' \
+    bash -x "$SCRIPT" > "$out_file" 2>&1 &
+  pid=$!
+  sleep 1
+  kill -TERM "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  rc=$?
+  expect_code 143 "$rc" "a SIGTERM delivered mid-call must exit 143, proving the HUP/INT/TERM traps are real and not merely declared"
+  token_hits=$(grep -c "sigterm-canary-token-value" "$out_file" 2>/dev/null) || token_hits=0
+  [ "$token_hits" = "0" ] || fail "the token leaked into the bash -x trace during signal handling (the cleanup function's own 'set +o xtrace' matters here, not only the top-level one)"
+  [ -z "$(find "$tmpdir" -type f 2>/dev/null)" ] || fail "a temp file survived a SIGTERM mid-call: $(find "$tmpdir" -type f)"
+  pass "SIGTERM delivered mid-call is caught by a real trap (exit 143), cleans up every temp file, and never leaks the token even under bash -x"
+}
+
 test_auth_header_file_is_mode_0600_while_curl_can_see_it() {
   local home fakebin modelog mode
   home="$TMP_ROOT/auth-mode"; mkdir -p "$home"
@@ -512,7 +630,7 @@ test_request_body_is_exactly_the_documented_max_tokens_1_shape() {
   PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_BODY_LOG="$bodylog" FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT" >/dev/null
   assert_present "$bodylog" "the request body must have been sent"
   body=$(cat "$bodylog")
-  assert_contains "$body" '"max_tokens":1' "the documented ~9-token cost bound depends on max_tokens being exactly 1"
+  assert_contains "$body" '"max_tokens":1,' "the documented ~9-token cost bound depends on max_tokens being exactly 1 (anchored with the trailing comma - an unanchored match here would also pass for 16384)"
   assert_contains "$body" '"model":"claude-haiku-4-5-20251001"' "the default model actually reaches the request body"
   [ "${#body}" -le 200 ] || fail "the request body is ${#body} bytes, far beyond the documented ~9-token shape (max_tokens bounds output only - AA5); the input side (the prompt) must stay bounded too"
   pass "the request body sent to curl is the documented max_tokens=1 shape on the default model, and its total size is bounded (not just max_tokens)"
@@ -527,13 +645,16 @@ test_curl_invocation_safety_properties() {
   assert_present "$log" "the fake curl must have been invoked"
   argv=$(cat "$log")
   assert_contains "$argv" "https://api.anthropic.com/v1/messages" "the exact documented endpoint must be used"
-  assert_contains "$argv" "-X POST" "the request must be a POST, not e.g. a GET"
+  assert_contains "$argv" " -X POST " "the request must be a POST, not e.g. a GET (space-anchored: an unanchored match would also pass a hypothetical -X POSTx)"
   assert_contains "$argv" "content-type: application/json" "the content-type header must be present"
   assert_contains "$argv" "anthropic-version: 2023-06-01" "the anthropic-version header must be present"
-  assert_contains "$argv" "anthropic-beta: oauth-2025-04-20" "the anthropic-beta header must be present"
-  assert_contains "$argv" "-m 10" "the default timeout must actually be passed to curl as -m"
-  assert_not_contains "$argv" " -L " "curl must never follow redirects (-L), or the bearer token could be replayed to a redirect target"
-  pass "the curl invocation has every documented safety property: exact endpoint, POST, required headers, a real timeout bound, and no redirect-following"
+  assert_contains "$argv" "anthropic-beta: oauth-2025-04-20" "the anthropic-beta header must be present - sent deliberately, though a live call with it removed returns an identical header set on this account, so it is not proven required (ADV-7)"
+  assert_contains "$argv" " -A fm-claude-quota/1 " "the identifying User-Agent must actually reach curl"
+  assert_contains "$argv" " -w %{http_code}" "curl's own -w format must actually be requested, or HTTP_CODE would be empty and the numeric guard would fire on every call"
+  assert_contains "$argv" " -m 10 " "the default timeout must actually be passed to curl as -m (space-anchored on both sides: an unanchored '-m 10' would also pass a mutant sending -m 100)"
+  assert_not_contains "$argv" " -L " "curl must never follow redirects via the short flag"
+  assert_not_contains "$argv" "--location" "curl must never follow redirects via the long flag either (ADV-1: the short-flag check alone does not catch this spelling)"
+  pass "the curl invocation has every documented safety property: exact endpoint, POST, required headers, User-Agent, the http_code format, a real timeout bound, and no redirect-following under either spelling"
 }
 
 test_model_rejects_characters_outside_the_documented_set() {
@@ -561,6 +682,49 @@ test_help_does_not_require_a_token() {
   expect_code 0 "$rc" "--help must succeed with no token set"
   assert_contains "$out" "Usage:" "help text names its usage"
   pass "--help works without a token or a network call"
+}
+
+test_help_dash_h_alias_works() {
+  local out rc
+  out=$(env -u CLAUDE_CODE_OAUTH_TOKEN "$SCRIPT" -h 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "-h must work the same as --help"
+  assert_contains "$out" "Usage:" "help text names its usage"
+  pass "-h works as an alias for --help"
+}
+
+test_unknown_flag_is_rejected() {
+  local home fakebin log out rc
+  home="$TMP_ROOT/unknown-flag"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  # This guard is NOT backstopped by set -u the way the --model/--timeout
+  # missing-value guards are (ADV-8): a typo'd flag with no dedicated test
+  # would silently probe with every default and exit 0.
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_LOG="$log" "$SCRIPT" --modl claude-x 2>&1)
+  rc=$?
+  expect_code 2 "$rc" "an unrecognised flag must be rejected, not silently probe with defaults"
+  assert_contains "$out" "unrecognised argument" "usage error names the problem"
+  assert_absent "$log" "an unrecognised flag must never reach curl"
+  pass "an unrecognised flag is rejected before any network call"
+}
+
+test_help_fails_loudly_when_usage_text_is_genuinely_unreadable() {
+  local home stripped out rc
+  home="$TMP_ROOT/help-unreadable"; mkdir -p "$home"
+  stripped="$home/stripped-copy.sh"
+  # A copy of the real script with every comment line removed (the shebang
+  # kept) still executes identically otherwise, but its own usage-extracting
+  # awk now opens the file fine and reads zero matching lines - the exact
+  # "awk succeeds, output is empty" shape ADV-3 demonstrated survives a naive
+  # `fm_claude_quota_usage; exit 0` and must now be caught by name.
+  sed -n '1p; /^#/!p' "$SCRIPT" > "$stripped"
+  chmod +x "$stripped"
+  out=$(env -u CLAUDE_CODE_OAUTH_TOKEN "$stripped" --help 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "empty (not merely unopenable) usage text must fail loudly, not silently exit 0 with zero bytes of output (ADV-3)"
+  assert_contains "$out" "could not read this script" "the failure names what happened rather than exiting silently"
+  pass "--help fails loudly with a clear message when its own usage text opens fine but reads as empty"
 }
 
 test_help_works_when_invoked_through_a_symlink_under_a_different_name() {
@@ -601,6 +765,8 @@ test_no_ratelimit_headers_at_all_is_a_hard_failure
 test_non_2xx_without_headers_fails_closed
 test_non_2xx_with_full_headers_is_parsed_not_discarded
 test_headers_present_but_every_value_malformed_fails_closed
+test_valid_threshold_and_fallback_do_not_rescue_all_malformed_measurements
+test_raw_fields_only_with_no_measurement_fails_closed
 test_malformed_header_values_read_unknown_not_a_fabricated_reading
 test_trailing_whitespace_on_a_header_value_still_parses
 test_duplicate_header_last_value_wins
@@ -608,6 +774,7 @@ test_curl_returns_non_numeric_http_status_fails_closed
 test_curl_transport_failure_fails_closed
 test_token_never_appears_in_curl_argv
 test_token_never_leaks_under_xtrace
+test_sigterm_mid_call_cleans_up_exits_143_and_does_not_leak_under_xtrace
 test_auth_header_file_is_mode_0600_while_curl_can_see_it
 test_temp_files_are_cleaned_up_after_a_run
 test_request_body_is_exactly_the_documented_max_tokens_1_shape
@@ -615,5 +782,8 @@ test_curl_invocation_safety_properties
 test_model_rejects_characters_outside_the_documented_set
 test_model_rejects_empty_value
 test_help_does_not_require_a_token
+test_help_dash_h_alias_works
+test_unknown_flag_is_rejected
+test_help_fails_loudly_when_usage_text_is_genuinely_unreadable
 test_help_works_when_invoked_through_a_symlink_under_a_different_name
 test_help_works_when_invoked_as_a_renamed_copy

@@ -73,7 +73,12 @@
 # epoch (e.g. "1") still passes as a reading, because bounding "plausible"
 # would need this script to trust its own clock, and Anthropic controls this
 # value regardless. Either shape check failing reads "unknown" rather than
-# passing through whatever arrived.
+# passing through whatever arrived. The seven "raw" fields below (every
+# *_status, *_disabled_reason, representative_claim, upgrade_paths) are
+# passed through verbatim once present - by design, not oversight: an
+# unrecognised-but-real value (e.g. a new status Anthropic starts sending)
+# is more useful passed through than erased against a fixed enum this script
+# would then need to keep current.
 #
 #   probe_http_status                    the HTTP status this reading came
 #                                         from. Usually 2xx; see below for why
@@ -106,14 +111,19 @@
 #                                         Anthropic has been observed to add
 #   unmapped_unified_headers             count of anthropic-ratelimit-unified-*
 #                                         response headers that matched none
-#                                         of the field names above. The header
+#                                         of the field names above.
+#   unmapped_unified_header_names        comma-list of those unmapped
+#                                         headers' own names (e.g. "fallback"),
+#                                         lowercased, or "none". The header
 #                                         set has been observed to change
-#                                         within days (a header this script
-#                                         once confirmed absent can reappear),
-#                                         so a nonzero count here is a signal
-#                                         that a future header set may carry
-#                                         quota information this script does
-#                                         not yet surface by name - it is not
+#                                         within HOURS - a header this script
+#                                         once confirmed fully covered had a
+#                                         new one appear the same day - so a
+#                                         count alone was judged not enough:
+#                                         a caller (or a human) can look at
+#                                         this field and know WHAT is missing
+#                                         without a code change. Neither
+#                                         field being nonzero/non-"none" is
 #                                         itself a failure.
 #
 # utilization is a 0-1 fraction (0.94 = 94% used, and can exceed 1 once a
@@ -123,17 +133,24 @@
 # Failure is always closed and always explicit, on stderr, with a nonzero
 # exit: no token, curl missing, the HTTP call failing or timing out, a
 # response - of any HTTP status - that carries no anthropic-ratelimit-unified-*
-# headers at all, or a response that carries such headers but whose values
-# ALL fail their shape check (which reads identically to "this plan reports
-# fewer meters" unless it is itself distinguished - see the header-count and
-# parsed-count guards below). None of these print any "key=value" line - a
-# caller must never mistake a failed probe for a real all-unknown reading.
+# headers at all, or a response that carries such headers but where every
+# single *_utilization/*_reset MEASUREMENT (not the static *_surpassed_threshold
+# fields, and not fallback_percentage) fails its shape check. That second
+# guard fires even when a raw field (unified_status, overage_disabled_reason,
+# etc.) parsed successfully - a status with no number attached is not
+# something a quota-aware caller can act on, so this script treats "no usable
+# measurement" as a failure regardless of what raw text came with it. This
+# case has never actually been observed on the one account this script has
+# been tested against; it is a deliberate choice for an unobserved case, not
+# a proven-necessary one. None of these failure paths print any "key=value"
+# line - a caller must never mistake a failed probe for a real all-unknown
+# reading.
 #
-# A response that carries these headers is parsed and emitted exactly the
-# same way regardless of its HTTP status: a rate-limited or rejected call
+# A response that carries a usable measurement is parsed and emitted exactly
+# the same way regardless of its HTTP status: a rate-limited or rejected call
 # (429, 403) is precisely the state where the reading matters most, and
 # Anthropic's own server volunteers it right alongside the rejection. Only a
-# response carrying no usable meters at all - a malformed call, a wrong
+# response carrying no usable measurement at all - a malformed call, a wrong
 # endpoint, a contract change - is treated as a probe failure rather than a
 # reading. Whether a 5xx (as opposed to 4xx) carrying meters should be
 # trusted the same way is an open design question for whichever later work
@@ -183,10 +200,13 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --help|-h)
-      # Exit status reflects whether the usage text was actually readable -
-      # not an unconditional success - so a broken SELF path (or any other
-      # reason awk fails) is reported rather than silently exiting 0.
-      if fm_claude_quota_usage; then
+      # Exit status reflects whether the usage text was actually readable AND
+      # non-empty - not an unconditional success - so a broken SELF path, or
+      # awk successfully opening it but reading nothing, is reported rather
+      # than silently exiting 0 with zero bytes of output.
+      HELP_TEXT=$(fm_claude_quota_usage)
+      if [ -n "$HELP_TEXT" ]; then
+        printf '%s\n' "$HELP_TEXT"
         exit 0
       fi
       printf 'fm-claude-quota.sh: could not read this script'"'"'s own usage text from %s.\n' "$SELF" >&2
@@ -381,24 +401,50 @@ UPGRADE_PATHS=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-upgrade-p
 FALLBACK_PERCENTAGE=$(fm_claude_quota_or_unknown anthropic-ratelimit-unified-fallback-percentage utilization)
 
 # Headers are present (HEADER_HITS > 0), but "present" is not "usable": every
-# value above can independently degrade to "unknown" (BB2). If every single
-# numeric meter did, this reading carries no usable number at all and must
-# not exit 0 looking identical to a plan that legitimately has fewer windows.
+# value above can independently degrade to "unknown" (BB2). This guard counts
+# only the seven fields that are actual MEASUREMENTS (*_utilization,
+# *_reset) - deliberately excluding the two *_surpassed_threshold fields
+# (static configured thresholds, not measurements) and fallback_percentage
+# (an auxiliary meter), because counting those let this guard survive a
+# response where every real measurement was malformed but a threshold
+# happened to parse (a reviewer-demonstrated gap in an earlier version of
+# this guard). If every measurement failed, this reading carries no usable
+# number at all and must not exit 0 looking identical to a plan that
+# legitimately has fewer windows. This deliberately also fails closed on a
+# response carrying only raw fields (status, disabled_reason, etc.) with no
+# measurement at all - a plausible-in-principle subset this script has never
+# actually observed - because a status with no number attached is not
+# something a quota-aware caller can act on; see the header comment above.
 PARSED_NUMERIC_COUNT=0
 for value in "$UNIFIED_RESET" "$FIVE_HOUR_RESET" "$FIVE_HOUR_UTILIZATION" \
-  "$SEVEN_DAY_RESET" "$SEVEN_DAY_UTILIZATION" "$SEVEN_DAY_SURPASSED_THRESHOLD" \
-  "$OVERAGE_RESET" "$OVERAGE_UTILIZATION" "$OVERAGE_SURPASSED_THRESHOLD" \
-  "$FALLBACK_PERCENTAGE"; do
+  "$SEVEN_DAY_RESET" "$SEVEN_DAY_UTILIZATION" \
+  "$OVERAGE_RESET" "$OVERAGE_UTILIZATION"; do
   [ "$value" = unknown ] || PARSED_NUMERIC_COUNT=$((PARSED_NUMERIC_COUNT + 1))
 done
 if [ "$PARSED_NUMERIC_COUNT" -eq 0 ]; then
-  printf 'fm-claude-quota.sh: the probe returned HTTP %s with anthropic-ratelimit-unified-* headers present, but no numeric meter parsed as valid; treating this as a probe failure rather than an all-unknown reading.\n' "$HTTP_CODE" >&2
+  printf 'fm-claude-quota.sh: the probe returned HTTP %s with anthropic-ratelimit-unified-* headers present, but no *_utilization or *_reset measurement parsed as valid; treating this as a probe failure rather than an all-unknown reading.\n' "$HTTP_CODE" >&2
   exit 1
 fi
 
 KNOWN_UNIFIED_HEADER_REGEX='^anthropic-ratelimit-unified-(status|reset|5h-status|5h-reset|5h-utilization|7d-status|7d-reset|7d-utilization|7d-surpassed-threshold|overage-status|overage-reset|overage-utilization|overage-surpassed-threshold|overage-disabled-reason|representative-claim|upgrade-paths|fallback-percentage):'
 UNMAPPED_HITS=$(grep -i '^anthropic-ratelimit-unified-' "$HEADERS_FILE" 2>/dev/null | grep -Evic "$KNOWN_UNIFIED_HEADER_REGEX") || UNMAPPED_HITS=0
 case "$UNMAPPED_HITS" in ''|*[!0-9]*) UNMAPPED_HITS=0 ;; esac
+# The count alone was shown (2026-08-30 review) to go stale within hours of
+# being written - a header this script did not yet know about appeared on
+# the very account that proved the count was zero - so the unmapped names
+# themselves are also emitted, not just how many there are. Lowercased first
+# (a header name is never case-significant on the wire) so the fixed-case
+# prefix strip works regardless of source casing, and the result is limited
+# to a conservative character set since header-name content is still
+# untrusted input.
+UNMAPPED_NAMES=$(grep -i '^anthropic-ratelimit-unified-' "$HEADERS_FILE" 2>/dev/null \
+  | grep -Evi "$KNOWN_UNIFIED_HEADER_REGEX" \
+  | tr '[:upper:]' '[:lower:]' \
+  | sed -E 's/\r$//; s/^anthropic-ratelimit-unified-//; s/:.*$//' \
+  | LC_ALL=C sort -u \
+  | paste -sd, - 2>/dev/null) || UNMAPPED_NAMES=
+UNMAPPED_NAMES=$(printf '%s' "$UNMAPPED_NAMES" | tr -cd 'a-z0-9,._-')
+[ -n "$UNMAPPED_NAMES" ] || UNMAPPED_NAMES=none
 
 printf 'probe_http_status=%s\n' "$HTTP_CODE"
 printf 'unified_status=%s\n' "$UNIFIED_STATUS"
@@ -419,5 +465,6 @@ printf 'representative_claim=%s\n' "$REPRESENTATIVE_CLAIM"
 printf 'upgrade_paths=%s\n' "$UPGRADE_PATHS"
 printf 'fallback_percentage=%s\n' "$FALLBACK_PERCENTAGE"
 printf 'unmapped_unified_headers=%s\n' "$UNMAPPED_HITS"
+printf 'unmapped_unified_header_names=%s\n' "$UNMAPPED_NAMES"
 
 exit 0
