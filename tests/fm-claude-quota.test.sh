@@ -53,6 +53,56 @@
 # All of these are defence in depth or provably redundant; none is a behaviour
 # a caller can observe. The point of listing them is that "50 of 60" is a
 # checkable claim and "every guard is covered" was not.
+#
+# PLATFORM PORTABILITY (2026-08-30). The first Linux CI run of this suite failed
+# on `stat -f '%Lp' ... || stat -c '%a' ...`: GNU stat's -f means "display
+# FILESYSTEM status" and SUCCEEDS on a plain file, so the fallback never ran and
+# the mode assertion compared `  File: "/tmp/..."` against 600. Nine prior review
+# and verification passes all ran on macOS and all missed it. The lesson is the
+# construction, not the command: `A || B` is a sound fallback only where A can
+# FAIL, and is unsound wherever A can succeed with a DIFFERENT MEANING. The
+# probe now selects by output shape, so the value is provably a mode.
+#
+# Swept for that class afterwards, with denominators:
+#
+#   `A || B` constructs, both files                     39 examined
+#     - LHS is a test expression ([ ] / [[ ]])          22  unambiguous by construction
+#     - LHS is a command whose only alternative is
+#       failure (mktemp, chmod, printf, cat, grep,
+#       paste, command -v)                              16  sound
+#     - LHS could succeed with a different meaning       1  the stat probe, fixed here
+#     Remaining instances of the hazardous shape:        0
+#
+#   BSD/GNU divergence-prone commands considered        29
+#     - not used anywhere in either file                12  date, readlink, base64, xargs,
+#                                                           mv, ps, seq, du, uniq, cut,
+#                                                           touch, realpath (category empty,
+#                                                           reported as empty rather than
+#                                                           silently skipped)
+#     - used, and identical on both platforms           15  sed -n, mktemp with an explicit
+#                                                           template (never the -t form,
+#                                                           which does differ), grep
+#                                                           -i/-c/-E/-v/-q/-x/-F, head -c/-n,
+#                                                           tail -n, find -type, cp, sort -u,
+#                                                           tr, paste -sd, POSIX awk, ln -s,
+#                                                           chmod, kill by signal NAME, env -u
+#     - used, differ, and the difference is handled      1  wc -l pads its output on BSD; every
+#                                                           use pipes through `tr -d ' '`
+#     - used, differ, no observable effect               1  `sed -E 's/\r$//'` - GNU sed reads
+#                                                           \r as carriage return, BSD sed as a
+#                                                           literal r. Benign because the very
+#                                                           next expression, `s/:.*$//`, removes
+#                                                           everything from the first colon on,
+#                                                           including the CR, on both platforms.
+#                                                           Left as-is deliberately rather than
+#                                                           changing a reviewed script for a
+#                                                           non-bug; the all-mixed-case test
+#                                                           pins the resulting name identically
+#                                                           on macOS and Linux.
+#
+# This suite is now run on BOTH platforms before being believed. Local green on
+# one platform proves nothing about the other, which is exactly how the stat
+# fault survived nine passes.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -116,8 +166,30 @@ while [ $# -gt 0 ]; do
         @*)
           authfile=${2#@}
           if [ -n "${FAKE_CURL_AUTH_MODE_LOG:-}" ] && [ -f "$authfile" ]; then
-            { stat -f '%Lp' "$authfile" 2>/dev/null || stat -c '%a' "$authfile" 2>/dev/null; } \
-              >> "$FAKE_CURL_AUTH_MODE_LOG"
+            # Read the permission bits on both platforms, selecting the answer
+            # by its OUTPUT SHAPE and never by exit status.
+            #
+            # The two spellings are not a failure-fallback pair. GNU stat's -f
+            # means "display FILESYSTEM status" and SUCCEEDS on a plain file,
+            # so the previous `stat -f ... || stat -c ...` never reached its
+            # fallback on Linux and logged `  File: "/tmp/..."` as the mode.
+            # The assertion then compared a mode against a filesystem report.
+            # Nine macOS-only runs passed; the first Linux CI run caught it.
+            # An `A || B` fallback is only sound where A FAILS - where A
+            # succeeds with a different meaning it returns a confident wrong
+            # answer, so the shape check below is what makes this provably a
+            # mode. If neither spelling yields octal digits the value stays
+            # empty and the assertion fails loudly rather than passing.
+            mode=
+            for candidate in \
+              "$(stat -c '%a' "$authfile" 2>/dev/null)" \
+              "$(stat -f '%Lp' "$authfile" 2>/dev/null)"; do
+              case "$candidate" in
+                ''|*[!0-7]*) ;;
+                *) mode=$candidate; break ;;
+              esac
+            done
+            printf '%s\n' "$mode" >> "$FAKE_CURL_AUTH_MODE_LOG"
           fi
           ;;
       esac
@@ -826,6 +898,9 @@ test_auth_header_file_is_mode_0600_while_curl_can_see_it() {
   PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_AUTH_MODE_LOG="$modelog" FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT" >/dev/null
   assert_present "$modelog" "the auth header temp file must have existed while curl ran"
   mode=$(head -n1 "$modelog")
+  case "$mode" in
+    ''|*[!0-7]*) fail "the mode probe did not return octal permission bits at all, it returned: [$mode] - the probe itself is broken, which is a different fault from a wrong mode" ;;
+  esac
   [ "$mode" = "600" ] || fail "auth header temp file must be mode 0600, was $mode"
   pass "the auth header temp file is mode 0600 for the whole time curl can see it"
 }
