@@ -4,19 +4,55 @@
 # captured anthropic-ratelimit-unified-* header fixtures, so these stay
 # hermetic: no ports, no real /v1/messages call, deterministic in CI.
 #
-# A 2026-08-29 adversarial review round found that fixing exactly what a
-# reviewer named, without sweeping the same defect CLASS elsewhere, leaves an
-# identical hole one function later - a can't-fail transport-failure test
-# right next to the can't-fail HTTP-error test that had already been fixed.
-# So every fixture here is built with real CRLF line endings and an
-# HTTP/2-style status line (the live API's actual wire format - all-LF,
-# HTTP/1.1 fixtures never exercised the CR-strip every emitted value depends
-# on), at least one mixed-case header name (the live wire format lowercases
-# everything, but a proxy or intermediary need not, so the case-insensitive
-# match is tested independently of what this one account happens to send),
-# and every guard in the script - not a sample of the ones a reviewer
-# happened to name - has a fixture/assertion pair that would fail if that
-# guard were deleted (recorded in the sweep notes in the PR description).
+# Every fixture here is built with real CRLF line endings and an HTTP/2-style
+# status line (the live API's actual wire format - all-LF, HTTP/1.1 fixtures
+# never exercised the CR-strip every emitted value depends on), and the
+# case-insensitive header match is exercised both with one mixed-case name
+# among lowercase ones and with an all-mixed-case block.
+#
+# COVERAGE, MEASURED RATHER THAN ASSERTED (2026-08-30). Four review rounds on
+# this branch each claimed a sweep was complete and were each disproved by
+# running the full population, so the populations below are stated with their
+# denominators and the survivors are named rather than rounded away. Each entry
+# is one mutation applied to a pristine copy of the script, verified to have
+# actually changed the file, then measured by running this entire suite:
+#
+#   emitted-field/header cross-mappings   272 of 272 killed  (17 fields x 16 other headers)
+#   emitted-field kind mis-mappings        34 of 34  killed  (17 fields x 2 wrong shape checks)
+#   emitted key/variable cross-pairings   380 of 380 killed  (20 printf keys x 19 other variables)
+#   option-parser branch mutations          7 of 7   killed
+#   named guards deleted or neutered       50 of 60  killed
+#
+# The ten surviving guard mutations are NOT claimed as covered. Each is listed
+# here with why it survives, so the next editor inherits the gap rather than a
+# false assurance:
+#
+#   set -u                       every path it would catch has its own guard,
+#                                 so no single mutation is observable.
+#   export LC_ALL=C              locale-dependent; grep -i behaved identically
+#                                 under tr_TR.UTF-8 on the platform tested, so
+#                                 no portable case makes it observable.
+#   trap HUP / INT / TERM        bash's DEFAULT disposition for each of these
+#                                 exits with the same 128+signum status AND
+#                                 still runs the EXIT trap, so the exit status
+#                                 and the cleanup are identical with or without
+#                                 the trap line. The three signal tests below
+#                                 pin those observable properties, which is all
+#                                 $? can show; they cannot prove the dedicated
+#                                 trap fired.
+#   cleanup's set +o xtrace      redundant with the first top-level one, which
+#   second top-level set +o xtrace  IS killed - that is where the property lives.
+#   umask 077                    superseded by mktemp's own 0600 creation and by
+#                                 the unconditional chmod 600 two lines later,
+#                                 which is killed.
+#   HEADER_HITS / UNMAPPED_HITS  they defend against grep -c emitting
+#     numeric sanitisation        non-numeric output, which cannot be produced
+#                                 without replacing grep entirely - and this
+#                                 script's other grep uses depend on it too.
+#
+# All of these are defence in depth or provably redundant; none is a behaviour
+# a caller can observe. The point of listing them is that "50 of 60" is a
+# checkable claim and "every guard is covered" was not.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -186,6 +222,92 @@ crlf \
   'anthropic-ratelimit-unified-completely-invented-field: 42' \
   > "$UNRECOGNISED_FIXTURE"
 
+# A mapping-discrimination fixture: every one of the 17 headers this script
+# maps carries a PAIRWISE-DISTINCT value, plus one unrecognised header, and it
+# is served under a distinct HTTP status. Realism is deliberately not its job -
+# FULL_FIXTURE keeps that role. Its job is that no two emitted fields can ever
+# read the same value, so any mis-mapping of any field onto any other header is
+# observable rather than hidden behind a shared literal.
+#
+# This exists because two review rounds fixed one collision each while leaving
+# the identical collision in the field beside it: a 2026-08-30 verification
+# round proved 16 of the 272 possible field/header cross-mappings survived a
+# green suite, 15 of them on five_hour_reset alone, which had no assertion on
+# its actual value anywhere. Pinning all 20 emitted values against distinct
+# sentinels in one place closes the CLASS, not an instance of it.
+#
+# The raw fields carry deliberately non-numeric sentinels, so a mutation that
+# also changed a raw field's SHAPE-CHECK kind (raw -> utilization/reset) turns
+# the sentinel into "unknown" and is caught by the same assertions.
+DISTINCT_FIXTURE="$TMP_ROOT/distinct-values.txt"
+crlf \
+  'HTTP/2 203 ' \
+  'anthropic-ratelimit-unified-status: sentinel-unified-status' \
+  'anthropic-ratelimit-unified-reset: 1788000001' \
+  'anthropic-ratelimit-unified-5h-status: sentinel-5h-status' \
+  'anthropic-ratelimit-unified-5h-reset: 1788000002' \
+  'anthropic-ratelimit-unified-5h-utilization: 0.101' \
+  'anthropic-ratelimit-unified-7d-status: sentinel-7d-status' \
+  'anthropic-ratelimit-unified-7d-reset: 1788000003' \
+  'anthropic-ratelimit-unified-7d-utilization: 0.202' \
+  'anthropic-ratelimit-unified-7d-surpassed-threshold: 0.303' \
+  'anthropic-ratelimit-unified-overage-status: sentinel-overage-status' \
+  'anthropic-ratelimit-unified-overage-reset: 1788000004' \
+  'anthropic-ratelimit-unified-overage-utilization: 0.404' \
+  'anthropic-ratelimit-unified-overage-surpassed-threshold: 0.505' \
+  'anthropic-ratelimit-unified-overage-disabled-reason: sentinel-disabled-reason' \
+  'anthropic-ratelimit-unified-representative-claim: sentinel-representative-claim' \
+  'anthropic-ratelimit-unified-upgrade-paths: sentinel-upgrade-paths' \
+  'anthropic-ratelimit-unified-fallback-percentage: 0.606' \
+  'anthropic-ratelimit-unified-mapping-sentinel: 0.707' \
+  > "$DISTINCT_FIXTURE"
+
+# Every numeric-kind field malformed EXCEPT 5h-utilization, which stays valid
+# so the run still exits 0 with a usable measurement and the individual
+# degradations stay observable. This pins the SHAPE CHECK on each numeric field
+# individually: a mutation changing any field's kind argument would stop that
+# field's own check from running.
+#
+# The *_reset values here are deliberately chosen to be UTILIZATION-valid but
+# RESET-invalid (epoch 0, and a decimal): the reset check ^[1-9][0-9]*$ is
+# strictly stronger than the utilization check ^[0-9]+([.][0-9]+)?$, so plain
+# non-numeric garbage cannot tell the two apart. A 2026-08-30 sweep of all 34
+# kind mis-mappings found exactly 3 survivors, all of them reset -> utilization,
+# for precisely that reason - a loosened reset field would then have reported
+# "resets at epoch 0" as a real reading.
+MALFORMED_EACH_FIXTURE="$TMP_ROOT/malformed-each.txt"
+crlf \
+  'HTTP/2 200 ' \
+  'anthropic-ratelimit-unified-status: allowed' \
+  'anthropic-ratelimit-unified-reset: 0' \
+  'anthropic-ratelimit-unified-5h-reset: 0' \
+  'anthropic-ratelimit-unified-5h-utilization: 0.42' \
+  'anthropic-ratelimit-unified-7d-reset: 1788098400.5' \
+  'anthropic-ratelimit-unified-7d-utilization: bad-7d-util' \
+  'anthropic-ratelimit-unified-7d-surpassed-threshold: bad-7d-threshold' \
+  'anthropic-ratelimit-unified-overage-reset: 0' \
+  'anthropic-ratelimit-unified-overage-utilization: bad-overage-util' \
+  'anthropic-ratelimit-unified-overage-surpassed-threshold: bad-overage-threshold' \
+  'anthropic-ratelimit-unified-fallback-percentage: bad-fallback' \
+  > "$MALFORMED_EACH_FIXTURE"
+
+# Every unified header mixed-case, including the unrecognised one, and that
+# unrecognised one carrying a character outside the emitted charset. The live
+# wire lowercases every header name, but a proxy or intermediary need not.
+# Three separate constructs survived a green suite before this fixture existed
+# (2026-08-30 guard sweep): the header-COUNT grep's -i (the previous fixtures
+# always had at least one all-lowercase unified header, so the count stayed
+# nonzero even case-sensitively), the unmapped-name lowercasing, and the
+# unmapped-name charset filter.
+MIXED_CASE_FIXTURE="$TMP_ROOT/mixed-case.txt"
+crlf \
+  'HTTP/2 200 ' \
+  'Anthropic-RateLimit-Unified-Status: allowed' \
+  'Anthropic-RateLimit-Unified-5H-Reset: 1788020400' \
+  'Anthropic-RateLimit-Unified-5H-Utilization: 0.55' \
+  'Anthropic-RateLimit-Unified-Weird+Name: 1' \
+  > "$MIXED_CASE_FIXTURE"
+
 # Only the 5-hour window, as a different plan/account might return - no 7d,
 # no overage.
 SUBSET_FIXTURE="$TMP_ROOT/subset-headers.txt"
@@ -293,6 +415,7 @@ test_no_token_fails_closed_with_no_curl_call() {
   rc=$?
   expect_code 1 "$rc" "missing token must fail closed"
   assert_not_contains "$out" "=" "no token -> no key=value line, not even a fabricated unknown one"
+  assert_contains "$out" "CLAUDE_CODE_OAUTH_TOKEN is not set" "the dedicated no-token guard must be what fired: set -u also aborts here with the same exit status, so only the message distinguishes them"
   assert_absent "$log" "missing token must never reach curl"
   pass "no token fails closed before any network call"
 }
@@ -375,7 +498,86 @@ test_full_headers_parse_and_distinguish_seat_from_spend_cap() {
   assert_not_kv_line "$out" "overage_utilization=0.94" "overage must never be conflated with the seat window's value"
   assert_not_kv_line "$out" "overage_surpassed_threshold=0.75" "the spend-cap threshold must never be conflated with the seat threshold's value (ADV-2)"
   assert_not_kv_line "$out" "overage_reset=1788098400" "the spend-cap reset must never be conflated with the seat reset's value (BF-2)"
+  assert_kv_line "$out" "unmapped_unified_headers=0" "this fixture carries only headers the script maps, so the unmapped count is zero"
+  assert_kv_line "$out" "unmapped_unified_header_names=none" "and the names field reads the literal \"none\" rather than an empty value - nothing pinned this default before the 2026-08-30 guard sweep, so deleting it survived a green suite"
   pass "full header set parses (mixed-case header name, real CRLF/HTTP2 wire format), keeping the seat window and spend cap distinct on status, utilization, threshold and reset"
+}
+
+# Every one of the 20 values this script emits, asserted against a fixture in
+# which no two headers share a value. This is the assertion that makes the
+# field/header mapping observable as a whole rather than field by field: with
+# pairwise-distinct sentinels, ANY field reading ANY other field's header
+# produces a value this test names and rejects.
+#
+# Enumerated denominator (2026-08-30): 20 emitted keys, 17 of them mapped
+# directly from a header, 3 derived (probe_http_status, unmapped_unified_headers,
+# unmapped_unified_header_names). Before this test, 19 of the 20 had a positive
+# value assertion somewhere and five_hour_reset had none at all; separately, two
+# fields were unfalsifiable anyway because the fixtures gave their header and
+# another header the same literal.
+test_every_emitted_field_reads_its_own_header_and_no_other() {
+  local home fakebin out rc
+  home="$TMP_ROOT/distinct"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HTTP_CODE=203 FAKE_HEADERS_FIXTURE="$DISTINCT_FIXTURE" "$SCRIPT")
+  rc=$?
+  expect_code 0 "$rc" "the distinct-value fixture is a complete, valid reading"
+  # All 17 header-mapped fields.
+  assert_kv_line "$out" "unified_status=sentinel-unified-status" "unified_status must read the top-level status header and nothing else"
+  assert_kv_line "$out" "unified_reset=1788000001" "unified_reset must read the top-level reset header and nothing else"
+  assert_kv_line "$out" "five_hour_status=sentinel-5h-status" "five_hour_status must read the 5h status header and nothing else"
+  assert_kv_line "$out" "five_hour_reset=1788000002" "five_hour_reset must read the 5h reset header and nothing else - this field had no assertion on its actual value anywhere in the suite, so 15 of its 16 possible mis-mappings survived a green suite, and on the live wire the 5h and overage resets were 29 hours apart"
+  assert_kv_line "$out" "five_hour_utilization=0.101" "five_hour_utilization must read the 5h utilization header and nothing else"
+  assert_kv_line "$out" "seven_day_status=sentinel-7d-status" "seven_day_status must read the 7d status header and nothing else"
+  assert_kv_line "$out" "seven_day_reset=1788000003" "seven_day_reset must read the 7d reset header and nothing else"
+  assert_kv_line "$out" "seven_day_utilization=0.202" "seven_day_utilization must read the 7d utilization header - the SEAT meter"
+  assert_kv_line "$out" "seven_day_surpassed_threshold=0.303" "seven_day_surpassed_threshold must read the 7d threshold header and nothing else"
+  assert_kv_line "$out" "overage_status=sentinel-overage-status" "overage_status must read the overage status header and nothing else"
+  assert_kv_line "$out" "overage_reset=1788000004" "overage_reset must read the overage reset header and nothing else"
+  assert_kv_line "$out" "overage_utilization=0.404" "overage_utilization must read the overage utilization header - the SPEND CAP, never the seat meter"
+  assert_kv_line "$out" "overage_surpassed_threshold=0.505" "overage_surpassed_threshold must read the overage threshold header and nothing else"
+  assert_kv_line "$out" "overage_disabled_reason=sentinel-disabled-reason" "overage_disabled_reason must read the overage disabled-reason header and nothing else"
+  assert_kv_line "$out" "representative_claim=sentinel-representative-claim" "representative_claim must read the representative-claim header and nothing else"
+  assert_kv_line "$out" "upgrade_paths=sentinel-upgrade-paths" "upgrade_paths must read the upgrade-paths header and nothing else"
+  assert_kv_line "$out" "fallback_percentage=0.606" "fallback_percentage must read the fallback-percentage header and nothing else"
+  # The 3 derived fields, pinned in the same reading.
+  assert_kv_line "$out" "probe_http_status=203" "probe_http_status must carry curl's own reported status, distinct here from every header value"
+  assert_kv_line "$out" "unmapped_unified_headers=1" "the one unrecognised header in this fixture is counted"
+  assert_kv_line "$out" "unmapped_unified_header_names=mapping-sentinel" "and named"
+  pass "all 20 emitted fields read their own header and no other, against a fixture where no two headers share a value"
+}
+
+# The shape check is applied per field, not just somewhere. Each numeric field
+# gets its own malformed value here, so a mutation changing any one field's
+# kind argument from utilization/reset to raw would pass that garbage through
+# instead of reading "unknown".
+test_each_numeric_field_applies_its_own_shape_check() {
+  local home fakebin out rc
+  home="$TMP_ROOT/malformed-each"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$MALFORMED_EACH_FIXTURE" "$SCRIPT")
+  rc=$?
+  expect_code 0 "$rc" "one valid measurement (5h-utilization) keeps this a usable reading, so the individual degradations are observable"
+  assert_kv_line "$out" "five_hour_utilization=0.42" "the one validly-shaped measurement still parses"
+  assert_kv_line "$out" "unified_reset=unknown" "epoch 0 is not a valid reset; it must read unknown even though it would pass the weaker utilization check"
+  assert_not_kv_line "$out" "unified_reset=0" "a reset of epoch 0 must never be emitted as a real reading"
+  assert_kv_line "$out" "five_hour_reset=unknown" "epoch 0 is not a valid 5h reset either"
+  assert_not_kv_line "$out" "five_hour_reset=0" "a reset of epoch 0 must never be emitted as a real reading"
+  assert_kv_line "$out" "seven_day_reset=unknown" "a decimal is not a valid epoch second; it must read unknown even though it would pass the weaker utilization check"
+  assert_not_kv_line "$out" "seven_day_reset=1788098400.5" "a fractional epoch must never be emitted as a real reading"
+  assert_kv_line "$out" "seven_day_utilization=unknown" "a malformed 7d utilization reads unknown"
+  assert_not_kv_line "$out" "seven_day_utilization=bad-7d-util" "and never passes the garbage through"
+  assert_kv_line "$out" "seven_day_surpassed_threshold=unknown" "a malformed 7d threshold reads unknown"
+  assert_not_kv_line "$out" "seven_day_surpassed_threshold=bad-7d-threshold" "and never passes the garbage through"
+  assert_kv_line "$out" "overage_reset=unknown" "epoch 0 is not a valid overage reset either"
+  assert_not_kv_line "$out" "overage_reset=0" "a reset of epoch 0 must never be emitted as a real reading"
+  assert_kv_line "$out" "overage_utilization=unknown" "a malformed overage utilization reads unknown"
+  assert_not_kv_line "$out" "overage_utilization=bad-overage-util" "and never passes the garbage through"
+  assert_kv_line "$out" "overage_surpassed_threshold=unknown" "a malformed overage threshold reads unknown"
+  assert_not_kv_line "$out" "overage_surpassed_threshold=bad-overage-threshold" "and never passes the garbage through"
+  assert_kv_line "$out" "fallback_percentage=unknown" "a malformed fallback percentage reads unknown"
+  assert_not_kv_line "$out" "fallback_percentage=bad-fallback" "and never passes the garbage through"
+  pass "every numeric field applies its own shape check individually, degrading to unknown rather than passing malformed data through"
 }
 
 test_unrecognised_header_does_not_break_parsing_of_the_full_set() {
@@ -656,7 +858,7 @@ test_request_body_is_exactly_the_documented_max_tokens_1_shape() {
 }
 
 test_curl_invocation_safety_properties() {
-  local home fakebin log argv last_token
+  local home fakebin log argv last_token first_token
   home="$TMP_ROOT/curl-safety"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   log="$home/curl.log"
@@ -667,12 +869,14 @@ test_curl_invocation_safety_properties() {
   # exact match on that last token (rather than assert_contains, which would
   # also pass for the base URL with a query string appended - found during
   # the 2026-08-30 exhaustive assertion sweep) is what actually pins it.
+  first_token=$(printf '%s' "${argv#argv=}" | awk '{print $1}')
+  [ "$first_token" = "-sS" ] || fail "curl must be invoked with -sS (silent, but still reporting errors) as its first flag, got: $first_token"
   last_token=$(printf '%s' "$argv" | awk '{print $NF}')
   [ "$last_token" = "https://api.anthropic.com/v1/messages" ] || fail "the exact documented endpoint must be the final argv token, got: $last_token"
   assert_contains "$argv" " -X POST " "the request must be a POST, not e.g. a GET (space-anchored: an unanchored match would also pass a hypothetical -X POSTx)"
-  assert_contains "$argv" "content-type: application/json" "the content-type header must be present"
-  assert_contains "$argv" "anthropic-version: 2023-06-01" "the anthropic-version header must be present"
-  assert_contains "$argv" "anthropic-beta: oauth-2025-04-20" "the anthropic-beta header must be present - sent deliberately, though a live call with it removed returns an identical header set on this account, so it is not proven required (ADV-7)"
+  assert_contains "$argv" "content-type: application/json " "the content-type header must be present (trailing-anchored: the unanchored form also passed for application/jsonl or a charset-appended variant)"
+  assert_contains "$argv" "anthropic-version: 2023-06-01 " "the anthropic-version header must be present (trailing-anchored: the unanchored form also passed for a mutant sending 2023-06-011, i.e. a different API version)"
+  assert_contains "$argv" "anthropic-beta: oauth-2025-04-20 " "the anthropic-beta header must be present (trailing-anchored for the same reason as the two above) - sent deliberately, though a live call with it removed returns an identical header set on this account, so it is not proven required (ADV-7)"
   assert_contains "$argv" " -A fm-claude-quota/1 " "the identifying User-Agent must actually reach curl"
   assert_contains "$argv" " -w %{http_code} " "curl's own -w format must actually be requested exactly, or HTTP_CODE would carry extra data appended to it (space-anchored on both sides - found unanchored on the trailing side during the 2026-08-30 sweep, where extending the format string to %{http_code}%{time_total} survived)"
   assert_contains "$argv" " -m 10 " "the default timeout must actually be passed to curl as -m (space-anchored on both sides: an unanchored '-m 10' would also pass a mutant sending -m 100)"
@@ -683,10 +887,237 @@ test_curl_invocation_safety_properties() {
   # (curl will not act on a redirect) regardless of how -L is spelled or
   # where it appears, so it is the authoritative assertion here; the two
   # substring checks are kept only as a cheap, redundant early signal.
-  assert_contains "$argv" "--max-redirs 0" "curl must be given --max-redirs 0, which is what actually prevents the bearer token from being replayed to a redirect target regardless of -L's spelling or position"
+  assert_contains "$argv" " --max-redirs 0 " "curl must be given --max-redirs 0, which is what actually prevents the bearer token from being replayed to a redirect target regardless of -L's spelling or position (space-anchored on both sides: the unanchored form this assertion was first written with also passed for --max-redirs 07, which follows redirects and replays the bearer token - demonstrated end to end against a local redirect server during the 2026-08-30 verification round, with the suite green)"
   assert_not_contains "$argv" " -L " "curl must never follow redirects via the short flag (redundant with --max-redirs 0 above)"
   assert_not_contains "$argv" "--location" "curl must never follow redirects via the long flag either (redundant with --max-redirs 0 above)"
+  # Two credential-exposure properties that no assertion pinned before the
+  # 2026-08-30 verification round: adding either flag survived a green suite.
+  # Neither is a defect in the shipped script; both are cheap to pin while the
+  # argv block is being anchored anyway.
+  assert_not_contains "$argv" "--insecure" "curl must never be told to skip TLS verification - the bearer token would then be exposed to any interception on the path"
+  assert_not_contains "$argv" " -k " "curl must never skip TLS verification via the short flag either"
+  assert_not_contains "$argv" " -x " "curl must never be pointed at a proxy - the bearer token would then be handed to a third party"
+  assert_not_contains "$argv" "--proxy" "curl must never be pointed at a proxy via the long flag either"
   pass "the curl invocation has every documented safety property: exact endpoint, POST, required headers, User-Agent, the http_code format, a real timeout bound, and --max-redirs 0 (which pins the no-redirect-following property regardless of -L's spelling or position)"
+}
+
+# The --model=VALUE / --timeout=VALUE spellings are separate case branches from
+# the space-separated ones, and had no test at all until the 2026-08-30
+# coverage pass: deleting either branch made that spelling fall through to the
+# unrecognised-argument guard, with a green suite. This also pins that a
+# NON-DEFAULT model and timeout actually reach curl - every other assertion in
+# this suite exercises only the defaults, so a mutation ignoring the parsed
+# value and always sending the default survived too.
+# make_failing_mktemp <dir>: drops a `mktemp` shim into the same fakebin as the
+# fake curl. It counts invocations in a file and, on the call named by
+# FAKE_MKTEMP_FAIL_ON, either exits nonzero (simulating an exhausted or
+# unwritable TMPDIR) or - when FAKE_MKTEMP_DIR_ON names it - creates a
+# DIRECTORY where the script expects a file, which is the cheapest way to make
+# the subsequent write fail while mktemp and chmod both still succeed. Every
+# other call delegates to the real mktemp.
+#
+# This exists because seven of the script's guards (four mktemp failures, the
+# chmod failure, the auth-file write failure, and the auth mktemp failure)
+# fire only on a filesystem error, so nothing exercised them: all seven
+# survived deletion against a green suite in the 2026-08-30 guard sweep.
+make_failing_mktemp() {
+  local dir=$1 fakebin real
+  fakebin=$(fm_fakebin "$dir")
+  real=$(command -v mktemp)
+  cat > "$fakebin/mktemp" <<SH
+#!/usr/bin/env bash
+n=\$(cat "\$FAKE_MKTEMP_COUNT" 2>/dev/null || echo 0)
+n=\$((n + 1))
+printf '%s' "\$n" > "\$FAKE_MKTEMP_COUNT"
+if [ "\$n" = "\${FAKE_MKTEMP_FAIL_ON:-}" ]; then
+  printf 'mktemp: simulated failure\n' >&2
+  exit 1
+fi
+if [ "\$n" = "\${FAKE_MKTEMP_DIR_ON:-}" ]; then
+  d=\$($real -d "\$@") || exit 1
+  printf '%s\n' "\$d"
+  exit 0
+fi
+exec $real "\$@"
+SH
+  chmod +x "$fakebin/mktemp"
+  printf '%s\n' "$fakebin"
+}
+
+# Each of the five mktemp calls, in the order the script makes them, failed in
+# turn. Each must fail closed with its OWN message: they backstop each other
+# (a failed auth mktemp also trips the chmod guard), so only the message
+# distinguishes which guard actually fired.
+test_each_temp_file_creation_failure_fails_closed_with_its_own_message() {
+  local home fakebin countfile out rc n want
+  home="$TMP_ROOT/mktemp-fail"; mkdir -p "$home"
+  make_fake_curl "$home" >/dev/null
+  fakebin=$(make_failing_mktemp "$home")
+  countfile="$home/mktemp.count"
+  n=0
+  for want in \
+    "could not create a temp file for the auth header" \
+    "could not create a temp file for the request body" \
+    "could not create a temp file for response headers" \
+    "could not create a temp file for the response body" \
+    "could not create a temp file for curl diagnostics"; do
+    n=$((n + 1))
+    rm -f "$countfile"
+    out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token \
+      FAKE_MKTEMP_COUNT="$countfile" FAKE_MKTEMP_FAIL_ON="$n" \
+      FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT" 2>&1)
+    rc=$?
+    expect_code 1 "$rc" "a failure creating temp file $n must fail closed"
+    assert_contains "$out" "$want" "temp file $n's own guard must be the one that fired"
+    assert_not_contains "$out" "=" "a temp-file failure must never print any key=value line"
+  done
+  pass "each of the five temp-file creations failing in turn fails closed with that guard's own message"
+}
+
+test_auth_file_permission_failure_fails_closed() {
+  local home fakebin out rc
+  home="$TMP_ROOT/chmod-fail"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  cat > "$fakebin/chmod" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/chmod"
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "failing to restrict the auth file's permissions must fail closed rather than proceed with a world-readable token file"
+  assert_contains "$out" "could not restrict permissions on the auth header temp file" "the permission guard's own message must be what fired"
+  assert_not_contains "$out" "=" "this failure must never print any key=value line"
+  pass "a chmod failure on the auth header temp file fails closed rather than proceeding with an unrestricted token file"
+}
+
+test_auth_file_write_failure_fails_closed() {
+  local home fakebin countfile out rc
+  home="$TMP_ROOT/auth-write-fail"; mkdir -p "$home"
+  make_fake_curl "$home" >/dev/null
+  fakebin=$(make_failing_mktemp "$home")
+  countfile="$home/mktemp.count"
+  # mktemp returns a DIRECTORY for the auth file: mktemp and chmod both
+  # succeed, and only the write itself fails.
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token \
+    FAKE_MKTEMP_COUNT="$countfile" FAKE_MKTEMP_DIR_ON=1 \
+    FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "failing to write the auth header file must fail closed rather than call the API with no Authorization header"
+  assert_contains "$out" "could not write the auth header temp file" "the write guard's own message must be what fired"
+  assert_not_contains "$out" "=" "this failure must never print any key=value line"
+  pass "a failure writing the auth header temp file fails closed rather than probing unauthenticated"
+}
+
+test_every_header_name_mixed_case_still_parses_and_normalises_unmapped_names() {
+  local home fakebin out rc
+  home="$TMP_ROOT/mixed-case"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$MIXED_CASE_FIXTURE" "$SCRIPT")
+  rc=$?
+  expect_code 0 "$rc" "a response whose unified headers are ALL mixed-case must still be recognised as carrying meters at all - the header-count grep is case-insensitive"
+  assert_kv_line "$out" "five_hour_utilization=0.55" "a mixed-case header name still resolves to its field"
+  assert_kv_line "$out" "five_hour_reset=1788020400" "and so does the reset beside it"
+  assert_kv_line "$out" "unmapped_unified_headers=1" "the mixed-case unrecognised header is still counted"
+  assert_kv_line "$out" "unmapped_unified_header_names=weirdname" "an unmapped header name is lowercased AND filtered to the emitted charset: Weird+Name -> weirdname. Without the lowercasing it would read eirdame (the charset filter strips capitals); without the charset filter it would read weird+name"
+  pass "an all-mixed-case header block parses, and an unmapped header name is lowercased and charset-filtered before being emitted"
+}
+
+# HUP and INT, the two signal traps nothing exercised before the 2026-08-30
+# guard sweep - deleting either survived a green suite. As with the SIGTERM
+# case above, this pins the OBSERVABLE behaviour (exit status, no temp file
+# left behind) and deliberately does not claim to prove the dedicated trap
+# line fired rather than bash's default disposition: $? cannot tell them apart.
+assert_signal_mid_call_is_clean() {
+  local signal=$1 want=$2 home fakebin tmpdir pid rc
+  home="$TMP_ROOT/sig-$signal"; mkdir -p "$home"
+  fakebin=$(make_slow_fake_curl "$home")
+  tmpdir="$home/tmp"; mkdir -p "$tmpdir"
+  # Job control on: a background job started from a NON-interactive shell
+  # inherits SIGINT as SIG_IGN, and bash cannot trap a signal it inherited
+  # ignored - so without set -m the SIGINT case silently exits 0 having
+  # ignored the signal entirely, which would make this test vacuous.
+  set -m
+  TMPDIR="$tmpdir" PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token \
+    "$SCRIPT" >/dev/null 2>&1 &
+  pid=$!
+  set +m
+  sleep 1
+  kill -"$signal" "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  rc=$?
+  expect_code "$want" "$rc" "a SIG$signal delivered mid-call must exit $want"
+  [ -z "$(find "$tmpdir" -type f 2>/dev/null)" ] || fail "a temp file survived a SIG$signal mid-call: $(find "$tmpdir" -type f)"
+}
+
+test_sighup_mid_call_exits_129_and_leaves_no_temp_file() {
+  assert_signal_mid_call_is_clean HUP 129
+  pass "a SIGHUP delivered mid-call exits 129 and leaves no temp file behind"
+}
+
+test_sigint_mid_call_exits_130_and_leaves_no_temp_file() {
+  assert_signal_mid_call_is_clean INT 130
+  pass "a SIGINT delivered mid-call exits 130 and leaves no temp file behind"
+}
+
+# The two option guards that reject a flag given with no value at all. Both are
+# backstopped by set -u (which aborts on the unset $2), so only the exit status
+# and the guard's own message distinguish them - deleting either survived a
+# green suite before the 2026-08-30 guard sweep.
+test_option_with_no_value_is_a_usage_error_naming_the_option() {
+  local home fakebin log out rc
+  home="$TMP_ROOT/missing-value"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_LOG="$log" "$SCRIPT" --model 2>&1)
+  rc=$?
+  expect_code 2 "$rc" "--model with no value must be a usage error (exit 2), not a set -u abort (exit 1)"
+  assert_contains "$out" "--model requires a value" "the guard's own message must name the option"
+  out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_LOG="$log" "$SCRIPT" --timeout 2>&1)
+  rc=$?
+  expect_code 2 "$rc" "--timeout with no value must be a usage error (exit 2), not a set -u abort (exit 1)"
+  assert_contains "$out" "--timeout requires a value" "the guard's own message must name the option"
+  assert_absent "$log" "neither malformed invocation may reach curl"
+  pass "--model and --timeout given with no value are usage errors naming the option, not bare set -u aborts"
+}
+
+test_equals_form_options_are_parsed_and_reach_curl() {
+  local home fakebin log bodylog argv body rc
+  home="$TMP_ROOT/equals-form"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"; bodylog="$home/body.log"
+  PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_LOG="$log" \
+    FAKE_CURL_BODY_LOG="$bodylog" FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" \
+    "$SCRIPT" --model=claude-probe-model-9 --timeout=25 >/dev/null
+  rc=$?
+  expect_code 0 "$rc" "the --opt=value spelling must be accepted, not rejected as an unrecognised argument"
+  assert_present "$log" "the equals-form invocation must still reach curl"
+  argv=$(cat "$log"); body=$(cat "$bodylog")
+  assert_contains "$argv" " -m 25 " "a non-default --timeout=25 must reach curl as -m 25, not the default 10 (space-anchored on both sides)"
+  assert_not_contains "$argv" " -m 10 " "the default timeout must not be sent when a non-default one was given"
+  assert_contains "$body" '"model":"claude-probe-model-9"' "a non-default --model= must reach the request body, not the default model"
+  assert_not_contains "$body" "claude-haiku-4-5-20251001" "the default model must not be sent when a non-default one was given"
+  pass "the --model=/--timeout= equals spellings parse and their non-default values reach curl"
+}
+
+# The space-separated spellings, same property: a non-default value must
+# actually reach curl rather than the default being sent regardless.
+test_space_form_non_default_values_reach_curl() {
+  local home fakebin log bodylog argv body rc
+  home="$TMP_ROOT/space-form"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"; bodylog="$home/body.log"
+  PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_LOG="$log" \
+    FAKE_CURL_BODY_LOG="$bodylog" FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" \
+    "$SCRIPT" --model claude-probe-model-9 --timeout 25 >/dev/null
+  rc=$?
+  expect_code 0 "$rc" "the space-separated spelling must be accepted"
+  argv=$(cat "$log"); body=$(cat "$bodylog")
+  assert_contains "$argv" " -m 25 " "a non-default --timeout must reach curl as -m 25 (space-anchored on both sides)"
+  assert_not_contains "$argv" " -m 10 " "the default timeout must not be sent when a non-default one was given"
+  assert_contains "$body" '"model":"claude-probe-model-9"' "a non-default --model must reach the request body"
+  assert_not_contains "$body" "claude-haiku-4-5-20251001" "the default model must not be sent when a non-default one was given"
+  pass "the space-separated --model/--timeout spellings pass their non-default values through to curl"
 }
 
 test_model_rejects_characters_outside_the_documented_set() {
@@ -792,6 +1223,8 @@ test_timeout_rejects_value_above_range
 test_bad_timeout_is_a_usage_error
 test_full_headers_parse_and_distinguish_seat_from_spend_cap
 test_unrecognised_header_does_not_break_parsing_of_the_full_set
+test_every_emitted_field_reads_its_own_header_and_no_other
+test_each_numeric_field_applies_its_own_shape_check
 test_subset_headers_report_missing_meters_as_unknown_not_zero
 test_no_ratelimit_headers_at_all_is_a_hard_failure
 test_non_2xx_without_headers_fails_closed
@@ -811,6 +1244,15 @@ test_auth_header_file_is_mode_0600_while_curl_can_see_it
 test_temp_files_are_cleaned_up_after_a_run
 test_request_body_is_exactly_the_documented_max_tokens_1_shape
 test_curl_invocation_safety_properties
+test_every_header_name_mixed_case_still_parses_and_normalises_unmapped_names
+test_each_temp_file_creation_failure_fails_closed_with_its_own_message
+test_auth_file_permission_failure_fails_closed
+test_auth_file_write_failure_fails_closed
+test_sighup_mid_call_exits_129_and_leaves_no_temp_file
+test_sigint_mid_call_exits_130_and_leaves_no_temp_file
+test_option_with_no_value_is_a_usage_error_naming_the_option
+test_equals_form_options_are_parsed_and_reach_curl
+test_space_form_non_default_values_reach_curl
 test_model_rejects_characters_outside_the_documented_set
 test_model_rejects_empty_value
 test_help_does_not_require_a_token
