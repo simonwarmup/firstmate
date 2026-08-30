@@ -40,7 +40,12 @@
 # `claude setup-token`. No new credential and no new scope are requested.
 # The token is written to a mode-0600 temp file and passed to curl as
 # `-H "@<file>"`, so it never appears in curl's argv (never visible to `ps`)
-# and the file is removed on exit. Shell tracing (`set -x`/`bash -x`) is
+# and the file is removed on exit. curl is never given `-L`, and is
+# explicitly given `--max-redirs 0`, so the Authorization header this script
+# sends can never be replayed to a redirect target regardless of whether a
+# future edit accidentally adds `-L`/`--location` in any spelling or
+# position - `--max-redirs 0` pins the actual safety property rather than
+# depending on `-L` never being present. Shell tracing (`set -x`/`bash -x`) is
 # explicitly disabled by this script for the same reason: if this script is
 # ever invoked or sourced under xtrace, the trace would otherwise print every
 # command including the one that writes the token to that file. The token is
@@ -302,6 +307,7 @@ CURL_STDERR_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-claude-quota-stderr.XXXXXX") || {
 }
 
 HTTP_CODE=$(curl -sS -m "$TIMEOUT" \
+  --max-redirs 0 \
   -D "$HEADERS_FILE" \
   -o "$RESPONSE_BODY_FILE" \
   -w '%{http_code}' \

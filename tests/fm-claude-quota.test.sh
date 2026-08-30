@@ -167,7 +167,7 @@ UNRECOGNISED_FIXTURE="$TMP_ROOT/unrecognised-header.txt"
 crlf \
   'HTTP/2 200 ' \
   'anthropic-ratelimit-unified-status: allowed_warning' \
-  'anthropic-ratelimit-unified-reset: 1788098400' \
+  'anthropic-ratelimit-unified-reset: 1788010000' \
   'anthropic-ratelimit-unified-5h-status: allowed' \
   'anthropic-ratelimit-unified-5h-reset: 1788020400' \
   'anthropic-ratelimit-unified-5h-utilization: 0.13' \
@@ -362,16 +362,20 @@ test_full_headers_parse_and_distinguish_seat_from_spend_cap() {
   out=$(PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT")
   assert_kv_line "$out" "probe_http_status=200" "the HTTP status this reading came from"
   assert_kv_line "$out" "unified_status=allowed_warning" "top-level status, sent here under a mixed-case header name"
+  assert_kv_line "$out" "five_hour_status=allowed" "the 5h window's own status (BF-2, 2026-08-30 verification round: this field had no assertion anywhere in the suite, so mis-mapping it to unified_status went unnoticed)"
   assert_kv_line "$out" "five_hour_utilization=0.13" "5h window"
+  assert_kv_line "$out" "seven_day_status=allowed_warning" "the 7d window's own status (found unasserted-when-present during the exhaustive per-field sweep, 2026-08-30 verification round: only its absent->unknown case had a test)"
   assert_kv_line "$out" "seven_day_utilization=0.94" "seat/weekly window (7d)"
   assert_kv_line "$out" "seven_day_surpassed_threshold=0.75" "seat threshold"
+  assert_kv_line "$out" "overage_reset=1788220800" "the spend cap's own reset (BF-2: also had no assertion anywhere, though FULL_FIXTURE always carried a distinct value for it)"
   assert_kv_line "$out" "overage_utilization=1.05" "spend cap (overage), distinct from seven_day_utilization"
   assert_kv_line "$out" "overage_surpassed_threshold=1.0" "spend cap threshold - the other half of the seat/spend-cap pair (ADV-2): the utilization conflation alone was pinned, but not this one, so a mapping mistake between the two thresholds went unnoticed"
   assert_kv_line "$out" "overage_disabled_reason=org_spend_cap_reached" "spend cap reason"
   assert_kv_line "$out" "representative_claim=seven_day" "which window unified_status is keyed to (ADV-2: previously unpinned, so a mis-mapping to another field would not have been noticed)"
   assert_not_kv_line "$out" "overage_utilization=0.94" "overage must never be conflated with the seat window's value"
   assert_not_kv_line "$out" "overage_surpassed_threshold=0.75" "the spend-cap threshold must never be conflated with the seat threshold's value (ADV-2)"
-  pass "full header set parses (mixed-case header name, real CRLF/HTTP2 wire format), keeping the seat window and spend cap distinct on both utilization and threshold"
+  assert_not_kv_line "$out" "overage_reset=1788098400" "the spend-cap reset must never be conflated with the seat reset's value (BF-2)"
+  pass "full header set parses (mixed-case header name, real CRLF/HTTP2 wire format), keeping the seat window and spend cap distinct on status, utilization, threshold and reset"
 }
 
 test_unrecognised_header_does_not_break_parsing_of_the_full_set() {
@@ -383,7 +387,7 @@ test_unrecognised_header_does_not_break_parsing_of_the_full_set() {
   assert_kv_line "$out" "seven_day_utilization=0.94" "seat window still parses"
   assert_kv_line "$out" "overage_utilization=1.05" "spend cap still parses"
   assert_kv_line "$out" "upgrade_paths=overage" "a documented field still parses"
-  assert_kv_line "$out" "unified_reset=1788098400" "a header this script did not originally name (AA4) is now parsed explicitly"
+  assert_kv_line "$out" "unified_reset=1788010000" "a header this script did not originally name (AA4) is now parsed explicitly. Deliberately a value distinct from every other *_reset in this fixture (BF-2, 2026-08-30 verification round): the original fixture gave unified_reset and seven_day_reset the identical value 1788098400, so a mutant that mis-mapped unified_reset onto anthropic-ratelimit-unified-7d-reset survived undetected - the live wire showed these two fields ~6.8 days apart on the account this script was tested against"
   assert_kv_line "$out" "fallback_percentage=0.5" "the newer fallback meter (AA4) is now parsed explicitly"
   assert_kv_line "$out" "unmapped_unified_headers=1" "the one genuinely unrecognised header is counted, not silently dropped with no signal (line-exact - an unanchored match here would also pass for a real count of 10)"
   assert_kv_line "$out" "unmapped_unified_header_names=completely-invented-field" "the unmapped header's own NAME is surfaced too (ADV-6) - a count alone was shown to go stale within hours of being written"
@@ -577,7 +581,22 @@ SH
   printf '%s\n' "$fakebin"
 }
 
-test_sigterm_mid_call_cleans_up_exits_143_and_does_not_leak_under_xtrace() {
+# test_sigterm_mid_call_observable_behavior_is_safe: what this test proves,
+# stated exactly, after a 2026-08-30 verification round found the previous
+# name/message claimed more (BF-1). On this bash, an UNTRAPPED fatal signal
+# still runs the EXIT trap before the process dies, and `wait` reports the
+# same 128+signum status (143 for TERM) that an explicit `trap '...; exit
+# 143' TERM` would also produce - the two are indistinguishable through $?,
+# which is the only thing a portable test can read here. So this test does
+# NOT prove the dedicated TERM/HUP/INT trap lines specifically fired rather
+# than bash's own default disposition (proving that would need something
+# lower-level than $?, e.g. WIFSIGNALED, which bash does not expose). What
+# it DOES prove, and what its name says: a SIGTERM delivered mid-call always
+# results in exit 143, leaves no temp file behind, and never leaks the token
+# into a live bash -x trace - real, verified, observable properties of the
+# script's behavior under a mid-call kill, regardless of which mechanism
+# produces them.
+test_sigterm_mid_call_observable_behavior_is_safe() {
   local home fakebin tmpdir out_file pid rc token_hits
   home="$TMP_ROOT/sigterm"; mkdir -p "$home"
   fakebin=$(make_slow_fake_curl "$home")
@@ -590,11 +609,11 @@ test_sigterm_mid_call_cleans_up_exits_143_and_does_not_leak_under_xtrace() {
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   rc=$?
-  expect_code 143 "$rc" "a SIGTERM delivered mid-call must exit 143, proving the HUP/INT/TERM traps are real and not merely declared"
+  expect_code 143 "$rc" "a SIGTERM delivered mid-call must exit 143 (this pins the observable exit status only - see the function comment above on what it cannot distinguish)"
   token_hits=$(grep -c "sigterm-canary-token-value" "$out_file" 2>/dev/null) || token_hits=0
-  [ "$token_hits" = "0" ] || fail "the token leaked into the bash -x trace during signal handling (the cleanup function's own 'set +o xtrace' matters here, not only the top-level one)"
+  [ "$token_hits" = "0" ] || fail "the token leaked into the bash -x trace during signal handling"
   [ -z "$(find "$tmpdir" -type f 2>/dev/null)" ] || fail "a temp file survived a SIGTERM mid-call: $(find "$tmpdir" -type f)"
-  pass "SIGTERM delivered mid-call is caught by a real trap (exit 143), cleans up every temp file, and never leaks the token even under bash -x"
+  pass "a SIGTERM delivered mid-call exits 143, leaves no temp file, and never leaks the token into a bash -x trace"
 }
 
 test_auth_header_file_is_mode_0600_while_curl_can_see_it() {
@@ -637,24 +656,37 @@ test_request_body_is_exactly_the_documented_max_tokens_1_shape() {
 }
 
 test_curl_invocation_safety_properties() {
-  local home fakebin log argv
+  local home fakebin log argv last_token
   home="$TMP_ROOT/curl-safety"; mkdir -p "$home"
   fakebin=$(make_fake_curl "$home")
   log="$home/curl.log"
   PATH="$fakebin:$BASE_PATH" CLAUDE_CODE_OAUTH_TOKEN=fake-token FAKE_CURL_LOG="$log" FAKE_HEADERS_FIXTURE="$FULL_FIXTURE" "$SCRIPT" >/dev/null
   assert_present "$log" "the fake curl must have been invoked"
   argv=$(cat "$log")
-  assert_contains "$argv" "https://api.anthropic.com/v1/messages" "the exact documented endpoint must be used"
+  # The endpoint is always the LAST argv token in the real invocation, so an
+  # exact match on that last token (rather than assert_contains, which would
+  # also pass for the base URL with a query string appended - found during
+  # the 2026-08-30 exhaustive assertion sweep) is what actually pins it.
+  last_token=$(printf '%s' "$argv" | awk '{print $NF}')
+  [ "$last_token" = "https://api.anthropic.com/v1/messages" ] || fail "the exact documented endpoint must be the final argv token, got: $last_token"
   assert_contains "$argv" " -X POST " "the request must be a POST, not e.g. a GET (space-anchored: an unanchored match would also pass a hypothetical -X POSTx)"
   assert_contains "$argv" "content-type: application/json" "the content-type header must be present"
   assert_contains "$argv" "anthropic-version: 2023-06-01" "the anthropic-version header must be present"
   assert_contains "$argv" "anthropic-beta: oauth-2025-04-20" "the anthropic-beta header must be present - sent deliberately, though a live call with it removed returns an identical header set on this account, so it is not proven required (ADV-7)"
   assert_contains "$argv" " -A fm-claude-quota/1 " "the identifying User-Agent must actually reach curl"
-  assert_contains "$argv" " -w %{http_code}" "curl's own -w format must actually be requested, or HTTP_CODE would be empty and the numeric guard would fire on every call"
+  assert_contains "$argv" " -w %{http_code} " "curl's own -w format must actually be requested exactly, or HTTP_CODE would carry extra data appended to it (space-anchored on both sides - found unanchored on the trailing side during the 2026-08-30 sweep, where extending the format string to %{http_code}%{time_total} survived)"
   assert_contains "$argv" " -m 10 " "the default timeout must actually be passed to curl as -m (space-anchored on both sides: an unanchored '-m 10' would also pass a mutant sending -m 100)"
-  assert_not_contains "$argv" " -L " "curl must never follow redirects via the short flag"
-  assert_not_contains "$argv" "--location" "curl must never follow redirects via the long flag either (ADV-1: the short-flag check alone does not catch this spelling)"
-  pass "the curl invocation has every documented safety property: exact endpoint, POST, required headers, User-Agent, the http_code format, a real timeout bound, and no redirect-following under either spelling"
+  # BF-3 (2026-08-30 verification round): substring-matching " -L " and
+  # "--location" only pins two specific spellings/positions of the flag -
+  # `curl -sSL` and a trailing `-L` after the URL both survived a green
+  # suite under the old checks. --max-redirs 0 pins the actual PROPERTY
+  # (curl will not act on a redirect) regardless of how -L is spelled or
+  # where it appears, so it is the authoritative assertion here; the two
+  # substring checks are kept only as a cheap, redundant early signal.
+  assert_contains "$argv" "--max-redirs 0" "curl must be given --max-redirs 0, which is what actually prevents the bearer token from being replayed to a redirect target regardless of -L's spelling or position"
+  assert_not_contains "$argv" " -L " "curl must never follow redirects via the short flag (redundant with --max-redirs 0 above)"
+  assert_not_contains "$argv" "--location" "curl must never follow redirects via the long flag either (redundant with --max-redirs 0 above)"
+  pass "the curl invocation has every documented safety property: exact endpoint, POST, required headers, User-Agent, the http_code format, a real timeout bound, and --max-redirs 0 (which pins the no-redirect-following property regardless of -L's spelling or position)"
 }
 
 test_model_rejects_characters_outside_the_documented_set() {
@@ -774,7 +806,7 @@ test_curl_returns_non_numeric_http_status_fails_closed
 test_curl_transport_failure_fails_closed
 test_token_never_appears_in_curl_argv
 test_token_never_leaks_under_xtrace
-test_sigterm_mid_call_cleans_up_exits_143_and_does_not_leak_under_xtrace
+test_sigterm_mid_call_observable_behavior_is_safe
 test_auth_header_file_is_mode_0600_while_curl_can_see_it
 test_temp_files_are_cleaned_up_after_a_run
 test_request_body_is_exactly_the_documented_max_tokens_1_shape
