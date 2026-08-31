@@ -588,6 +588,19 @@ fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
   return 0
 }
 
+# fm_backend_require_adapter: prove the named adapter file is readable BEFORE
+# `.` is asked to source it. Under `set -e` on bash 3.2 - the stock macOS
+# /bin/bash - `.` on a missing or unreadable file terminates the shell outright
+# instead of returning, so the `|| return 1` on each arm below never runs and a
+# caller that must refuse continues instead. Probing first turns that abort into
+# an ordinary non-zero return on every bash version.
+fm_backend_require_adapter() {  # <name>
+  local adapter="$FM_BACKEND_LIB_DIR/backends/$1.sh"
+  [ -r "$adapter" ] && return 0
+  echo "error: backend adapter for '$1' is missing or unreadable: $adapter" >&2
+  return 1
+}
+
 # fm_backend_source: source the named backend's adapter file, once per shell.
 # Each adapter is an independently linted canonical root. The /dev/null source
 # boundaries keep runtime dispatch from importing all five adapter ASTs into
@@ -598,6 +611,7 @@ fm_backend_source() {  # <name>
   case "$name" in
     tmux)
       if [ -z "${_FM_BACKEND_TMUX_SOURCED:-}" ]; then
+        fm_backend_require_adapter tmux || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/tmux.sh" || return 1
         _FM_BACKEND_TMUX_SOURCED=1
@@ -605,6 +619,7 @@ fm_backend_source() {  # <name>
       ;;
     herdr)
       if [ -z "${_FM_BACKEND_HERDR_SOURCED:-}" ]; then
+        fm_backend_require_adapter herdr || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/herdr.sh" || return 1
         _FM_BACKEND_HERDR_SOURCED=1
@@ -612,6 +627,7 @@ fm_backend_source() {  # <name>
       ;;
     zellij)
       if [ -z "${_FM_BACKEND_ZELLIJ_SOURCED:-}" ]; then
+        fm_backend_require_adapter zellij || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/zellij.sh" || return 1
         _FM_BACKEND_ZELLIJ_SOURCED=1
@@ -619,6 +635,7 @@ fm_backend_source() {  # <name>
       ;;
     orca)
       if [ -z "${_FM_BACKEND_ORCA_SOURCED:-}" ]; then
+        fm_backend_require_adapter orca || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/orca.sh" || return 1
         _FM_BACKEND_ORCA_SOURCED=1
@@ -626,6 +643,7 @@ fm_backend_source() {  # <name>
       ;;
     cmux)
       if [ -z "${_FM_BACKEND_CMUX_SOURCED:-}" ]; then
+        fm_backend_require_adapter cmux || return 1
         # shellcheck source=/dev/null
         . "$FM_BACKEND_LIB_DIR/backends/cmux.sh" || return 1
         _FM_BACKEND_CMUX_SOURCED=1

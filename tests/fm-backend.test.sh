@@ -503,6 +503,50 @@ test_backend_source_shell_portable() {
   pass "bash: fm_backend_source recognizes known backends and rejects unknown ones"
 }
 
+# A required file that is missing or unreadable must reach the CALLER as a
+# non-zero return. Under `set -e` on bash 3.2 - the stock macOS /bin/bash - `.`
+# on such a file terminates the shell outright instead of returning, so the
+# `|| return 1` on each arm never runs and a caller that must refuse continues
+# instead. Each case removes one required file from a private copy of bin/ and
+# asserts the caller's refusal branch ran AND execution continued past it;
+# pre-fix the probe shell dies and prints neither marker.
+assert_backend_source_refuses_missing() {  # <backend> <repo-relative-file> <label>
+  local backend=$1 rel=$2 label=$3 troot out rc
+  troot="$TMP_ROOT/source-missing-$label"
+  rm -rf "$troot"
+  mkdir -p "$troot"
+  cp -R "$ROOT/bin" "$troot/bin"
+  [ -e "$troot/$rel" ] || fail "source-missing-$label: fixture file $rel is not there to remove"
+  rm -f "$troot/$rel"
+  rc=0
+  out=$(/bin/bash -c '
+    set -eu
+    . "$1/bin/fm-backend.sh"
+    if fm_backend_source "$2"; then echo SOURCED; else echo REFUSED; fi
+    echo REACHED-END
+  ' _ "$troot" "$backend" 2>/dev/null) || rc=$?
+  assert_contains "$out" REFUSED \
+    "source-missing-$label: fm_backend_source did not return non-zero to its caller"
+  assert_contains "$out" REACHED-END \
+    "source-missing-$label: the shell was terminated instead of returning"
+  assert_not_contains "$out" SOURCED \
+    "source-missing-$label: fm_backend_source reported success without $rel"
+  [ "$rc" -eq 0 ] || fail "source-missing-$label: the probe shell itself failed (rc=$rc)"
+}
+
+test_backend_source_refuses_unreadable_adapter() {
+  # The adapter file itself, for every backend fm_backend_source can load.
+  assert_backend_source_refuses_missing tmux   bin/backends/tmux.sh   adapter-tmux
+  assert_backend_source_refuses_missing herdr  bin/backends/herdr.sh  adapter-herdr
+  assert_backend_source_refuses_missing zellij bin/backends/zellij.sh adapter-zellij
+  assert_backend_source_refuses_missing orca   bin/backends/orca.sh   adapter-orca
+  assert_backend_source_refuses_missing cmux   bin/backends/cmux.sh   adapter-cmux
+  # A required sibling library of the tmux adapter, which resolves its siblings
+  # from FM_BACKEND_LIB_DIR rather than from ${BASH_SOURCE[0]}.
+  assert_backend_source_refuses_missing tmux bin/fm-session-lock-lib.sh tmux-session-lock
+  pass "fm_backend_source returns non-zero for a missing adapter or tmux adapter library"
+}
+
 test_backend_validate_spawn_accepts_orca() {
   local out
   fm_backend_validate_spawn tmux 2>/dev/null || fail "fm_backend_validate_spawn should accept tmux"
@@ -1126,6 +1170,7 @@ test_backend_name_autodetect_notice
 test_backend_name_explicit_beats_detection
 test_backend_validate_refuses_unknown
 test_backend_source_shell_portable
+test_backend_source_refuses_unreadable_adapter
 test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
