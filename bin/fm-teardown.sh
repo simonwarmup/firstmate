@@ -163,30 +163,55 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
+# teardown_require_lib: prove a required sibling library is readable BEFORE `.`
+# is asked to source it. Under `set -e` on bash 3.2 - the stock macOS /bin/bash -
+# `.` on a missing or unreadable file terminates this script outright, the EXIT
+# trap then observes status 0, and teardown reports success having refused
+# nothing and cleaned up nothing. Probing first turns that silent abort into a
+# named refusal before any task, child, endpoint, or local-copy state changes.
+teardown_require_lib() {  # <path>
+  [ -r "$1" ] && return 0
+  echo "error: teardown refused: required library is missing or unreadable: $1" >&2
+  echo "error: nothing was changed - restore it and rerun teardown" >&2
+  exit 1
+}
+teardown_require_lib "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
 # shellcheck source=bin/fm-backlog-transition-lib.sh
 . "$SCRIPT_DIR/fm-backlog-transition-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-control-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-lock-lib.sh"
 # shellcheck source=bin/fm-lock-lib.sh
 . "$SCRIPT_DIR/fm-lock-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-classify-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-public-followup-lib.sh
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
 # shellcheck source=bin/fm-secondmate-parent-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
+teardown_require_lib "$SCRIPT_DIR/fm-nm-run-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
@@ -199,12 +224,14 @@ fm_backlog_directory_present "$STATE" "state directory" || {
   echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 }
+teardown_require_lib "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # Supervision lease guard: post-landing cleanup is overlap territory between
 # the two Pi supervision actors; refuse while the OTHER actor holds this
 # task's live lease (contract: bin/fm-lease-lib.sh; no-op in homes without
 # leases).
+teardown_require_lib "$SCRIPT_DIR/fm-lease-lib.sh"
 # shellcheck source=bin/fm-lease-lib.sh
 . "$SCRIPT_DIR/fm-lease-lib.sh"
 # Role partition: forced teardown discards work, and the supervision branch
@@ -2357,7 +2384,8 @@ teardown_herdr_require_prerequisites() {  # <task-id>
       return 1
     fi
   done
-  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
+  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1 \
+    && [ -r "$SCRIPT_DIR/fm-wake-lib.sh" ]; then
     # shellcheck source=bin/fm-wake-lib.sh
     . "$SCRIPT_DIR/fm-wake-lib.sh"
   fi

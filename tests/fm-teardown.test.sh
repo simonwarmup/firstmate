@@ -49,6 +49,12 @@
 #   (w) index.lock mtime read failure                         -> lock kept, REFUSE
 #   (x) transient lock cleared after first failed return      -> retry ALLOW
 #   (y) persistent lock (never clears, not provably stale)    -> REFUSE loudly
+#
+# Also covers required-dependency safety: teardown dot-sources its sibling
+# libraries, and on bash 3.2 (the stock macOS /bin/bash) `.` on a missing file
+# terminates the script under `set -e` instead of returning, so the refusal
+# never prints and cleanup is reported as done.
+#   (z) required sibling library missing -> named REFUSE, non-zero, no changes
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -1601,6 +1607,68 @@ test_herdr_flat_teardown_preflight_refuses_before_changes() {
   pass "herdr flat teardown preflight refuses before every destructive change"
 }
 
+# A required sibling library that is missing or unreadable must stop teardown
+# BEFORE any cleanup. Under `set -e` on bash 3.2 - the stock macOS /bin/bash -
+# `.` on such a file terminates this script outright, the EXIT trap then
+# observes status 0, and teardown reports success having refused nothing and
+# cleaned up nothing. Each case lands the work first, so a teardown with every
+# library present would SUCCEED and remove the fixture: the refusal below is
+# caused by the missing library, not by the landed-work gate. The same
+# readability probe covers an unreadable file; only the missing case is
+# asserted here because a test running as root can still read mode 000.
+assert_teardown_refuses_missing_required_lib() {  # <library-basename>
+  local lib=$1 case_dir rc thlog teardown_bin wt_head
+  case_dir=$(make_case "missing-lib-$lib")
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "merged work"
+  wt_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/project" update-ref refs/heads/main "$wt_head"
+  : > "$case_dir/state/task-x1.status"
+  thlog="$case_dir/treehouse.log"; : > "$thlog"
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$thlog"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  mkdir -p "$case_dir/test-root"
+  cp -R "$ROOT/bin" "$case_dir/test-root/bin"
+  [ -e "$case_dir/test-root/bin/$lib.sh" ] \
+    || fail "missing-lib-$lib: fixture library is not there to remove"
+  rm -f "$case_dir/test-root/bin/$lib.sh"
+  teardown_bin="$case_dir/test-root/bin/fm-teardown.sh"
+
+  rc=0
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
+    FM_DATA_OVERRIDE="$case_dir/data" FM_CONFIG_OVERRIDE="$case_dir/config" \
+    PATH="$case_dir/fakebin:${FM_TEARDOWN_TEST_PATH:-$PATH}" \
+    "$teardown_bin" task-x1 > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  [ "$rc" -ne 0 ] \
+    || fail "missing-lib-$lib: teardown exited 0 without its required library"
+  assert_grep "$lib.sh" "$case_dir/stderr" \
+    "missing-lib-$lib: the refusal never named the missing library"
+  assert_grep "nothing was changed" "$case_dir/stderr" \
+    "missing-lib-$lib: the refusal was not explained visibly"
+  [ -d "$case_dir/wt" ] || fail "missing-lib-$lib: refusal removed the isolated copy"
+  [ "$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD 2>/dev/null)" = "fm/task-x1" ] \
+    || fail "missing-lib-$lib: refusal dropped the task branch"
+  [ -e "$case_dir/state/task-x1.meta" ] \
+    || fail "missing-lib-$lib: refusal erased the durable endpoint metadata"
+  [ -e "$case_dir/state/task-x1.status" ] \
+    || fail "missing-lib-$lib: refusal erased the task status record"
+  [ ! -s "$thlog" ] || fail "missing-lib-$lib: refusal returned the isolated copy"
+}
+
+test_teardown_refuses_when_a_required_library_is_missing() {
+  # fm-nm-run-lib is the library the upstream report names; fm-lease-lib is the
+  # LAST required source in the block, so the two together pin both ends of it.
+  assert_teardown_refuses_missing_required_lib fm-nm-run-lib
+  assert_teardown_refuses_missing_required_lib fm-lease-lib
+  pass "teardown refuses and changes nothing when a required library is missing"
+}
+
 configure_secondmate_with_herdr_child() {  # <case-dir>
   local case_dir=$1 home="$1/secondmate-home"
   mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
@@ -2618,6 +2686,7 @@ test_herdr_teardown_clears_escalation_marker
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence
 test_herdr_flat_teardown_preflight_refuses_before_changes
+test_teardown_refuses_when_a_required_library_is_missing
 test_forced_secondmate_herdr_child_preflight_refuses_before_changes
 test_forced_secondmate_teardown_holds_descendant_lifecycle_locks
 test_forced_secondmate_herdr_child_retains_records_when_close_unconfirmed
